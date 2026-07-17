@@ -1,0 +1,14 @@
+{
+  "name": "chanin-colector",
+  "version": "0.1.0",
+  "description": "Colector diario de precios VTEX (Oechsle, Plaza Vea, Promart) — carril datos del proyecto Chanin",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "collect": "node collect.js",
+    "stats": "node stats.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0"
+  }
+}
