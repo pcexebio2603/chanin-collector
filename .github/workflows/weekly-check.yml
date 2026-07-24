@@ -1,0 +1,21 @@
+name: Chequeo semanal del colector
+
+on:
+  schedule:
+    - cron: '7 17 * * 0' # domingo 12:07 Lima (UTC-5), fuera de la ventana del colector
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # Sin npm install: el chequeo solo usa d1-client.js (fetch nativo de Node 20).
+      - name: Chequeo semanal → D1
+        run: node weekly-check-d1.js
