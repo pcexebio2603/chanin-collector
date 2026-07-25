@@ -31,8 +31,8 @@ jobs:
         run: |
           if [ -n "${{ github.event.inputs.max_pages }}" ]; then
             echo "== PRUEBA ACOTADA: plazavea, ${{ github.event.inputs.max_pages }} páginas/categoría =="
-            node collect.js --target d1 --retailer plazavea --max-pages ${{ github.event.inputs.max_pages }}
+            node collect.js --retailer plazavea --max-pages ${{ github.event.inputs.max_pages }}
           else
-            node collect.js --target d1
-            node falabella/collect-falabella.js --target d1
+            node collect.js
+            node falabella/collect-falabella.js
           fi

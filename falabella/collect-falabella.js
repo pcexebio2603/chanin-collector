@@ -1,9 +1,9 @@
 // Colector STANDALONE de precios de Falabella Perú — carril datos del proyecto Chanin.
 //
 // Falabella NO corre VTEX (plataforma custom Next.js + Cloudflare), por eso este colector
-// vive aparte de collect.js/vtex.js/config.js y NO los toca. Reutiliza colector/db.js:
-// escribe en la MISMA BD (colector/data/precios.db), mismo esquema, misma lógica de
-// "solo cambios" (retailer = 'falabella').
+// vive aparte de collect.js/vtex.js/config.js y NO los toca. Reutiliza colector/d1-writer.js:
+// escribe en la MISMA base D1, mismo esquema, misma lógica de "solo cambios"
+// (retailer = 'falabella').
 //
 // Fuente de datos (verificado 2026-07-13, ver ../../07-decision-falabella.md §2):
 //   API JSON del propio front (BFF listing-service), accesible server-side sin evadir nada:
@@ -22,9 +22,10 @@
 //   node collect-falabella.js                        # todas las categorías, corrida completa
 //   node collect-falabella.js --category cat40712    # una sola categoría
 //   node collect-falabella.js --max-pages 2          # corrida acotada (prueba)
-//   node collect-falabella.js --daily                # salta si ya corrió OK hoy
+// Escribe siempre a Cloudflare D1 (el backend SQLite local se retiró el 2026-07-25).
+// Requiere CLOUDFLARE_API_TOKEN en el entorno.
 import crypto from 'node:crypto';
-import { openDb, makeWriters, DB_PATH } from '../db.js';
+import { makeD1Writer } from '../d1-writer.js';
 
 const RETAILER = 'falabella';
 const BASE = 'https://www.falabella.com.pe';
@@ -106,7 +107,6 @@ const argOf = (flag) => {
 };
 const onlyCategory = argOf('--category');
 const maxPages = argOf('--max-pages') ? Number(argOf('--max-pages')) : Infinity;
-const dailyGuard = args.includes('--daily');
 
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -209,33 +209,13 @@ function normalize(p, categoryName) {
   };
 }
 
-const toD1 = argOf('--target') === 'd1'; // escribir a Cloudflare D1 (Actions) en vez de SQLite local
-
 async function main() {
-  let db = null;
-  let saveRow, insertRun, flush, maybeFlush;
-  if (toD1) {
-    const { makeD1Writer } = await import('../d1-writer.js');
-    const w = await makeD1Writer();
-    ({ saveRow, insertRun } = w);
-    flush = w.flush;
-    maybeFlush = w.maybeFlush;
-    log(`BD: Cloudflare D1 (${w.loaded.toLocaleString('es-PE')} con estado actual)`);
-  } else {
-    db = openDb();
-    ({ saveRow, insertRun } = makeWriters(db));
-    log(`BD: ${DB_PATH}`);
-    if (dailyGuard && db.prepare(`SELECT 1 FROM runs WHERE retailer=? AND status='ok' AND products>0 AND date(ts)=date('now') LIMIT 1`).get(RETAILER)) {
-      log(`[${RETAILER}] ya corrió OK hoy — saltado (--daily)`);
-      db.close();
-      return 0;
-    }
-  }
+  const { saveRow, insertRun, flush, maybeFlush, loaded } = await makeD1Writer();
+  log(`BD: Cloudflare D1 (${loaded.toLocaleString('es-PE')} con estado actual)`);
 
   const cats = CATEGORIES.filter((c) => !onlyCategory || c.id === onlyCategory);
   if (cats.length === 0) {
     log(`categoría --category ${onlyCategory} no está en la lista`);
-    if (db) db.close();
     return 1;
   }
 
@@ -273,7 +253,7 @@ async function main() {
       }
       log(`[${RETAILER}] ${cat.name} (${cat.id}): ${page - 1} páginas, count=${catCount ?? '?'}`);
       // Volcado incremental: un fallo de escritura cuesta un lote, no la corrida entera.
-      if (maybeFlush) await maybeFlush();
+      await maybeFlush();
     } catch (e) {
       stats.errors++;
       log(`[${RETAILER}] ERROR en categoría ${cat.name} (${cat.id}): ${e.message}`);
@@ -288,12 +268,9 @@ async function main() {
     `[${RETAILER}] FIN ${status}: ${stats.products} SKUs vistos, ${stats.changes} cambios guardados, ` +
       `${stats.errors} errores, ${Math.round(duration_ms / 1000)}s`
   );
-  if (flush) {
-    log('Escribiendo cambios a D1…');
-    await flush();
-    log('D1 actualizado.');
-  }
-  if (db) db.close();
+  log('Escribiendo cambios a D1…');
+  await flush();
+  log('D1 actualizado.');
   return fatal ? 1 : 0;
 }
 

@@ -1,14 +1,13 @@
 {
   "name": "chanin-colector",
-  "version": "0.1.0",
-  "description": "Colector diario de precios VTEX (Oechsle, Plaza Vea, Promart) — carril datos del proyecto Chanin",
+  "version": "0.2.0",
+  "description": "Colector diario de precios (Oechsle, Plaza Vea, Promart, Falabella) → Cloudflare D1 — carril datos del proyecto Chanin",
   "type": "module",
   "private": true,
   "scripts": {
     "collect": "node collect.js",
-    "stats": "node stats.js"
+    "collect:falabella": "node falabella/collect-falabella.js",
+    "check": "node weekly-check-d1.js --dry"
   },
-  "dependencies": {
-    "better-sqlite3": "^11.10.0"
-  }
+  "dependencies": {}
 }

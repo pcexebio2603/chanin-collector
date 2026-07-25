@@ -1,13 +1,15 @@
 // Colector diario de precios VTEX — carril datos del proyecto Chanin.
+// Escribe siempre a Cloudflare D1: el backend SQLite local se retiró el 2026-07-25, ya que los
+// colectores corren en GitHub Actions desde el 2026-07-17 y mantener dos esquemas en paralelo
+// sólo generaba divergencia (el local se quedó en el esquema v1).
 // Uso:
 //   node collect.js                           # los 3 retailers, corrida completa
 //   node collect.js --retailer oechsle        # uno solo
 //   node collect.js --max-pages 2             # corrida acotada (prueba)
-//   node collect.js --daily                   # salta retailers que ya corrieron OK hoy
-//                                             # (permite programar el cron varias veces al día)
+// Requiere CLOUDFLARE_API_TOKEN en el entorno (secret del repo en Actions).
 import { RETAILERS } from './config.js';
 import { categoryTree, leavesUnder, productsInCategory, normalize } from './vtex.js';
-import { openDb, makeWriters, DB_PATH } from './db.js';
+import { makeD1Writer } from './d1-writer.js';
 
 const args = process.argv.slice(2);
 const argOf = (flag) => {
@@ -16,40 +18,16 @@ const argOf = (flag) => {
 };
 const onlyRetailer = argOf('--retailer');
 const maxPages = argOf('--max-pages') ? Number(argOf('--max-pages')) : Infinity;
-const dailyGuard = args.includes('--daily');
-const toD1 = argOf('--target') === 'd1'; // escribir a Cloudflare D1 (Actions) en vez de SQLite local
 
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 
-// Backend: local (SQLite) o D1 (nube). Ambos exponen saveRow/insertRun; D1 además flush().
-let db = null;
-let saveRow, insertRun, flush, maybeFlush;
-if (toD1) {
-  const { makeD1Writer } = await import('./d1-writer.js');
-  const w = await makeD1Writer();
-  ({ saveRow, insertRun } = w);
-  flush = w.flush;
-  maybeFlush = w.maybeFlush;
-  log(`backend: D1 (${w.loaded.toLocaleString('es-PE')} productos con estado actual)`);
-} else {
-  db = openDb();
-  ({ saveRow, insertRun } = makeWriters(db));
-}
-log(toD1 ? 'BD: Cloudflare D1' : `BD: ${DB_PATH}`);
+const { saveRow, insertRun, flush, maybeFlush, loaded } = await makeD1Writer();
+log(`BD: Cloudflare D1 (${loaded.toLocaleString('es-PE')} productos con estado actual)`);
 
 let exitCode = 0;
 
-// El guard --daily solo aplica en local; en Actions el cron ya define la cadencia.
-const ranOkToday = db
-  ? db.prepare(`SELECT 1 FROM runs WHERE retailer = ? AND status = 'ok' AND products > 0 AND date(ts) = date('now') LIMIT 1`)
-  : null;
-
 for (const [retailer, cfg] of Object.entries(RETAILERS)) {
   if (onlyRetailer && retailer !== onlyRetailer) continue;
-  if (dailyGuard && ranOkToday && ranOkToday.get(retailer)) {
-    log(`[${retailer}] ya corrió OK hoy — saltado (--daily)`);
-    continue;
-  }
   const t0 = Date.now();
   const stats = { products: 0, changes: 0, errors: 0, categories: 0 };
   const seenSkus = new Set();
@@ -79,7 +57,7 @@ for (const [retailer, cfg] of Object.entries(RETAILERS)) {
         }
         if (pages > 0) log(`[${retailer}] ${leaf.name} (${leaf.path}): ${pages} páginas`);
         // Volcado incremental: un fallo de escritura cuesta un lote, no la corrida entera.
-        if (maybeFlush) await maybeFlush();
+        await maybeFlush();
       } catch (e) {
         stats.errors++;
         log(`[${retailer}] ERROR en categoría ${leaf.name} (${leaf.path}): ${e.message}`);
@@ -99,10 +77,7 @@ for (const [retailer, cfg] of Object.entries(RETAILERS)) {
   );
 }
 
-if (flush) {
-  log('Escribiendo cambios a D1…');
-  await flush();
-  log('D1 actualizado.');
-}
-if (db) db.close();
+log('Escribiendo cambios a D1…');
+await flush();
+log('D1 actualizado.');
 process.exit(exitCode);
