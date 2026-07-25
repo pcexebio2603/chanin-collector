@@ -23,13 +23,14 @@ const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 
 // Backend: local (SQLite) o D1 (nube). Ambos exponen saveRow/insertRun; D1 además flush().
 let db = null;
-let saveRow, insertRun, flush;
+let saveRow, insertRun, flush, maybeFlush;
 if (toD1) {
   const { makeD1Writer } = await import('./d1-writer.js');
   const w = await makeD1Writer();
   ({ saveRow, insertRun } = w);
   flush = w.flush;
-  log(`backend: D1 (${w.loaded.toLocaleString('es-PE')} productos en current_prices)`);
+  maybeFlush = w.maybeFlush;
+  log(`backend: D1 (${w.loaded.toLocaleString('es-PE')} productos con estado actual)`);
 } else {
   db = openDb();
   ({ saveRow, insertRun } = makeWriters(db));
@@ -77,6 +78,8 @@ for (const [retailer, cfg] of Object.entries(RETAILERS)) {
           }
         }
         if (pages > 0) log(`[${retailer}] ${leaf.name} (${leaf.path}): ${pages} páginas`);
+        // Volcado incremental: un fallo de escritura cuesta un lote, no la corrida entera.
+        if (maybeFlush) await maybeFlush();
       } catch (e) {
         stats.errors++;
         log(`[${retailer}] ERROR en categoría ${leaf.name} (${leaf.path}): ${e.message}`);

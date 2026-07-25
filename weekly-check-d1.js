@@ -36,9 +36,13 @@ const prev = prevRows[0] ?? null;
 // Cobertura actual (~7s en D1 sobre la BD completa)
 const diasByRetailer = {};
 let diasTotal = 0;
+// Esquema v2: `date` ya no se guarda (sale de ts, que es epoch) y `retailer` es un FK.
 for (const r of await query(
-  `SELECT p.retailer, COUNT(DISTINCT pp.date) dias
-   FROM price_points pp JOIN products p ON p.id = pp.product_fk GROUP BY p.retailer`
+  `SELECT rt.name AS retailer, COUNT(DISTINCT date(pp.ts, 'unixepoch')) dias
+   FROM price_points pp
+   JOIN products  p  ON p.id  = pp.product_fk
+   JOIN retailers rt ON rt.id = p.retailer
+   GROUP BY rt.name`
 )) {
   diasByRetailer[r.retailer] = r.dias;
   diasTotal += r.dias;
@@ -79,7 +83,7 @@ for (const r of RETAILERS) {
   if (run.status !== 'ok') {
     warns.push(`Retailer ${r}: última corrida con estado "${run.status}" (esperado "ok").`);
   }
-  const ageDays = (now - new Date(run.ts)) / 86400000;
+  const ageDays = (now - new Date(run.ts * 1000)) / 86400000; // runs.ts es epoch en segundos
   if (ageDays > FRESH_DAYS) {
     warns.push(`Retailer ${r}: última corrida hace ${ageDays.toFixed(1)} días (>${FRESH_DAYS}). ¿Actions dejó de correr?`);
   }
@@ -105,7 +109,7 @@ for (const r of RETAILERS) {
   const run = lastRunByRetailer[r];
   lines.push(
     run
-      ? `- ${r}: ${run.status} · ${run.products} SKUs · ${run.changes} cambios · ${String(run.ts).slice(0, 16)}`
+      ? `- ${r}: ${run.status} · ${run.products} SKUs · ${run.changes} cambios · ${new Date(run.ts * 1000).toISOString().slice(0, 16)}`
       : `- ${r}: (sin corridas)`
   );
 }

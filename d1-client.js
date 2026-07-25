@@ -3,7 +3,9 @@
 // el único secreto es CLOUDFLARE_API_TOKEN (con permiso D1 Edit), que en Actions viene de
 // un GitHub secret y en local de colector/.env.d1 (gitignored).
 const ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID || '76762e9b757ae62bbfc16c488fe1002d';
-const DBID = process.env.D1_DATABASE_ID || '0ae82b97-7597-47ed-9493-3ff995643cc6';
+// Base v2 (esquema comprimido, 2026-07-25). La v1 era 0ae82b97-7597-47ed-9493-3ff995643cc6
+// y sigue existiendo como rollback; para volver atrás basta exportar D1_DATABASE_ID con ese id.
+const DBID = process.env.D1_DATABASE_ID || '2888a1b9-229a-4200-bc5e-4e18fc6c245b';
 const TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 const URL = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/d1/database/${DBID}/query`;
 

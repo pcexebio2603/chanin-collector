@@ -213,13 +213,14 @@ const toD1 = argOf('--target') === 'd1'; // escribir a Cloudflare D1 (Actions) e
 
 async function main() {
   let db = null;
-  let saveRow, insertRun, flush;
+  let saveRow, insertRun, flush, maybeFlush;
   if (toD1) {
     const { makeD1Writer } = await import('../d1-writer.js');
     const w = await makeD1Writer();
     ({ saveRow, insertRun } = w);
     flush = w.flush;
-    log(`BD: Cloudflare D1 (${w.loaded.toLocaleString('es-PE')} en current_prices)`);
+    maybeFlush = w.maybeFlush;
+    log(`BD: Cloudflare D1 (${w.loaded.toLocaleString('es-PE')} con estado actual)`);
   } else {
     db = openDb();
     ({ saveRow, insertRun } = makeWriters(db));
@@ -271,6 +272,8 @@ async function main() {
         await sleep(SETTINGS.delayMs);
       }
       log(`[${RETAILER}] ${cat.name} (${cat.id}): ${page - 1} páginas, count=${catCount ?? '?'}`);
+      // Volcado incremental: un fallo de escritura cuesta un lote, no la corrida entera.
+      if (maybeFlush) await maybeFlush();
     } catch (e) {
       stats.errors++;
       log(`[${RETAILER}] ERROR en categoría ${cat.name} (${cat.id}): ${e.message}`);
