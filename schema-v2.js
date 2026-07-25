@@ -83,6 +83,22 @@ export function decodeImage(r, sku, img_var, img) {
 export const aCentimos = (n) => (n == null ? null : Math.round(n * 100));
 export const deCentimos = (c) => (c == null ? null : c / 100);
 
+// Techo de cordura: nada en estas cuatro tiendas vale un millón de soles. El corte es a
+// propósito muy alto — la franja S/50,000-100,000 está llena de precios REALES (LG 97" OLED
+// a S/89,999, plotters HP DesignJet, servidores HPE del marketplace de Falabella), así que un
+// umbral bajo borraría datos buenos.
+//
+// Lo que esto NO filtra, y no debe: los placeholders de catálogo (S/9,899, S/99,999) son
+// valores plausibles en sí mismos y sólo se delatan comparados con SU producto — una Lenovo
+// IdeaPad Slim 3 a S/99,999 es absurda, un LG 97" a S/89,999 no. Eso es trabajo del filtro de
+// credibilidad de Caza Precio (04 §8), que exige que el precio haya vivido días en el historial.
+// Tampoco filtra errores del vendedor plausibles: la tienda los publicó y registrar lo que la
+// tienda muestra es la premisa del producto.
+export const PRECIO_MAX_CENTIMOS = 100_000_000; // S/1,000,000
+
+export const precioSano = (centimos) =>
+  centimos != null && Number.isFinite(centimos) && centimos > 0 && centimos <= PRECIO_MAX_CENTIMOS;
+
 export const aEpoch = (iso) => (iso == null ? null : Math.floor(Date.parse(iso) / 1000));
 export const deEpoch = (s) => (s == null ? null : new Date(s * 1000).toISOString());
 

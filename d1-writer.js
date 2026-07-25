@@ -8,7 +8,9 @@
 // final: el 2026-07-25 ese diseño perdió una corrida entera de 3h26m (16,796 cambios) porque
 // la escritura falló al final. Ahora un fallo cuesta como mucho un lote.
 import { query, exec } from './d1-client.js';
-import { RETAILERS, BY_ID, encodeUrl, encodeImage, encodeCard, aCentimos } from './schema-v2.js';
+import {
+  RETAILERS, BY_ID, encodeUrl, encodeImage, encodeCard, aCentimos, precioSano, PRECIO_MAX_CENTIMOS,
+} from './schema-v2.js';
 
 const q = (v) => (v == null ? 'NULL' : "'" + String(v).replace(/'/g, "''") + "'");
 const num = (v) => (v == null ? 'NULL' : Number(v));
@@ -40,6 +42,7 @@ export async function makeD1Writer() {
   let pendientes = [];
   const runs = [];
   let escritos = 0;
+  let descartados = 0;
 
   // Igual firma que el writer local: síncrono, solo acumula, devuelve 1/0.
   function saveRow(row) {
@@ -49,6 +52,14 @@ export async function makeD1Writer() {
     const list = aCentimos(row.price_list);
     const card = encodeCard(row.card_teaser);
     const stock = row.in_stock ? 1 : 0; // normalizado: si no, un boolean nunca casaría con el 0/1 de la base
+
+    // Basura del marketplace: precios imposibles (un "Test Product" de un seller a S/999,999,999,999,
+    // almohadas a S/19,000,000). Se descarta el punto entero; si el producto es nuevo, ni se crea.
+    // Un producto ya rastreado conserva su último precio sano en vez de envenenar su mín/máx/promedio.
+    if (!precioSano(online)) {
+      descartados++;
+      return 0;
+    }
 
     if (prev && prev.cur_online === online && prev.cur_list === list &&
         prev.cur_stock === stock && prev.cur_card === card) {
@@ -150,6 +161,9 @@ export async function makeD1Writer() {
         `${num(r.products)},${num(r.changes)},${num(r.errors)},${num(r.duration_ms)},${q(r.status)})`
       ));
       runs.length = 0;
+    }
+    if (descartados) {
+      console.log(`${new Date().toISOString()} [d1] ${descartados} puntos descartados por precio imposible (>S/${(PRECIO_MAX_CENTIMOS / 100).toLocaleString('es-PE')})`);
     }
   }
 
