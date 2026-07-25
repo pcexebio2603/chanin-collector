@@ -38,7 +38,9 @@ Ver `../api/schema.sql` para el esquema completo y el porqué de cada decisión.
 - `retailers` / `categories` / `brands` — diccionarios; `products` los referencia por id.
 - `runs` — bitácora de corridas. `checks` — bitácora del chequeo semanal.
 
-`schema-v2.js` codifica y decodifica ese esquema (url/image comprimidas, céntimos, epoch). **Tiene un gemelo en `../api/schema-v2.js` y ambos deben mantenerse idénticos**: si divergen, la API reconstruye mal las URLs.
+`schema-v2.js` codifica y decodifica ese esquema (url/image comprimidas, céntimos, epoch). **Tiene un gemelo en `api/schema-v2.js` del repo privado y ambos deben mantenerse idénticos**: si divergen, el colector guarda con una convención y la API reconstruye con otra, y el fallo es silencioso.
+
+El despliegue de la API lo comprueba (`npm run paridad` allí) y aborta si no coinciden. Desde este lado no hay barrera automática — el repo público no ve el privado — así que **al tocar este fichero, cópialo también a `api/`**.
 
 ## Decisiones técnicas (por qué es así)
 
