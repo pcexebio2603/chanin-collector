@@ -1,8 +1,12 @@
 name: Colector Chanin → D1
 
 on:
-  schedule:
-    - cron: '13 12,0 * * *' # 07:00 y 19:00 Lima (UTC-5); 2 corridas/día
+  # PAUSADO 2026-07-25: la D1 llegó al tope de 500 MB del plan Free y el flush falla con
+  # "Exceeded maximum DB size", perdiendo la corrida entera. Además, una corrida a mitad de
+  # la migración de esquema dejaría el export inconsistente. RESTAURAR esta línea al terminar:
+  #   - cron: '13 12,0 * * *' # 07:00 y 19:00 Lima (UTC-5); 2 corridas/día
+  # schedule:
+  #   - cron: '13 12,0 * * *'
   workflow_dispatch:
     inputs:
       max_pages:
