@@ -1,4 +1,10 @@
 node_modules/
-.env.d1
+
+# Cualquier .env: aquí viven tokens de Cloudflare (.env.dns tiene uno de DNS/Email Routing).
+# El patrón es amplio a propósito — el token de D1 sólo debe existir como secret de GitHub.
+.env
+.env.*
+
+# Restos del colector local, retirado el 2026-07-25.
 data/
 logs/
