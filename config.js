@@ -31,8 +31,9 @@ export const SETTINGS = {
   pageSize: 50,            // máximo por request que permite VTEX (_from/_to)
   maxOffset: 2450,         // VTEX corta en 2500 resultados por consulta
   delayMs: 400,            // pausa entre requests (rate limit respetuoso)
-  retries: 3,
-  retryBaseMs: 2000,       // backoff: 2s, 4s, 8s
+  retries: 4,
+  retryBaseMs: 3000,       // backoff: 3s, 6s, 12s, 24s = 45s. Antes eran 3 reintentos y 14s,
+                           // insuficientes para los 500 intermitentes de Promart (2026-07-26).
   timeoutMs: 25000,
   treeDepth: 3,            // profundidad del árbol de categorías a descender
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',

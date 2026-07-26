@@ -51,17 +51,39 @@ for (const r of await query(
 // Última corrida por retailer
 const lastRunByRetailer = {};
 for (const r of await query(
-  `SELECT r.retailer, r.ts, r.status, r.products, r.changes
+  `SELECT r.retailer, r.ts, r.status, r.products, r.changes, r.errors
    FROM runs r JOIN (SELECT retailer, MAX(id) mid FROM runs GROUP BY retailer) m ON r.id = m.mid`
 )) {
   lastRunByRetailer[r.retailer] = r;
 }
 
+// SKUs vistos en la corrida ANTERIOR de cada retailer. Es la vara para juzgar si la última
+// perdió cobertura de verdad. Se compara contra la anterior y no contra el máximo histórico
+// porque los catálogos encogen solos: promart pasó de 87,425 a 82,283 SKUs en cinco días,
+// también en corridas con cero errores. Anclar al mejor dato de siempre convertiría esa deriva
+// normal en un aviso permanente.
+const anteriorByRetailer = {};
+for (const r of await query(
+  `SELECT retailer, products FROM (
+     SELECT retailer, products, ROW_NUMBER() OVER (PARTITION BY retailer ORDER BY id DESC) rk
+     FROM runs
+   ) WHERE rk = 2`
+)) {
+  anteriorByRetailer[r.retailer] = r.products;
+}
+
+// Caída de cobertura respecto a la corrida anterior que sí merece aviso.
+const COBERTURA_MINIMA = 0.95;
+
 // Evaluación
 const warns = [];
 const notes = [];
 
-if (prev) {
+if (prev && prev.date === today) {
+  // Dos chequeos el mismo día: "días" no puede haber crecido y avisar por eso sería una falsa
+  // alarma. Pasa al reejecutar a mano el chequeo del domingo.
+  notes.push(`Ya hubo un chequeo hoy (${prev.date}); el crecimiento de "días" no se evalúa dos veces en la misma jornada.`);
+} else if (prev) {
   if (diasTotal > prev.dias_total) {
     notes.push(`"días" creció: ${prev.dias_total} → ${diasTotal} (total sobre los ${RETAILERS.length} retailers).`);
   } else {
@@ -80,8 +102,27 @@ for (const r of RETAILERS) {
     warns.push(`Retailer ${r}: sin ninguna corrida registrada.`);
     continue;
   }
-  if (run.status !== 'ok') {
-    warns.push(`Retailer ${r}: última corrida con estado "${run.status}" (esperado "ok").`);
+  // El aviso se decide por COBERTURA, no por la etiqueta de estado. Las APIs VTEX devuelven
+  // 400/500 intermitentes (promart sobre todo: 5 de sus últimas 12 corridas fueron "parcial"),
+  // así que avisar por cualquier error suelto significaría un correo casi todas las semanas —
+  // y un aviso que siempre suena es un aviso que se deja de leer.
+  if (run.status === 'fallo') {
+    warns.push(`Retailer ${r}: última corrida con estado "fallo".`);
+  } else {
+    const anterior = anteriorByRetailer[r];
+    const cobertura = anterior ? run.products / anterior : 1;
+    const pct = (cobertura * 100).toFixed(1);
+    if (cobertura < COBERTURA_MINIMA) {
+      warns.push(
+        `Retailer ${r}: vio ${run.products} SKUs, el ${pct}% de los ${anterior} de la corrida ` +
+          `anterior. Caída de cobertura, no ruido de la API.`
+      );
+    } else if (run.status === 'parcial') {
+      notes.push(
+        `Retailer ${r}: corrida "parcial" por ${run.errors} categoría(s) con error transitorio, ` +
+          `pero conservó el ${pct}% de la cobertura anterior (${run.products} SKUs). Sin acción.`
+      );
+    }
   }
   const ageDays = (now - new Date(run.ts * 1000)) / 86400000; // runs.ts es epoch en segundos
   if (ageDays > FRESH_DAYS) {

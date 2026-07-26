@@ -14,8 +14,11 @@ async function getJson(url) {
       });
       // VTEX responde 206 (Partial Content) en búsquedas paginadas; 200 en el árbol.
       if (res.status === 200 || res.status === 206) return await res.json();
-      // 429/5xx: reintentar; otros códigos: rendirse ya.
-      if (res.status === 429 || res.status >= 500) {
+      // 400/429/5xx: reintentar. El 400 se incluye desde el 2026-07-26 porque Promart lo
+      // devuelve de forma ESPURIA: tres categorías fallaron con 400/500 en la corrida de ese
+      // día y minutos después las mismas URLs respondían 206 sin cambiar nada. Antes el 400
+      // no se reintentaba y se perdía la categoría entera.
+      if (res.status === 400 || res.status === 429 || res.status >= 500) {
         lastErr = new Error(`HTTP ${res.status} en ${url}`);
         continue;
       }
