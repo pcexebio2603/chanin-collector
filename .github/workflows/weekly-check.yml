@@ -2,7 +2,11 @@ name: Chequeo semanal del colector
 
 on:
   schedule:
-    - cron: '7 17 * * 0' # domingo 12:07 Lima (UTC-5), fuera de la ventana del colector
+    # Domingo 12:07 Lima (UTC-5), fuera de la ventana del colector.
+    # GitHub atribuye los runs programados a quien PUSHEÓ el último cambio de este fichero
+    # (no a quien firma el commit), y a esa cuenta le manda los correos de fallo. Si vuelven a
+    # llegar a la cuenta equivocada: `gh auth switch` a la buena y tocar esta línea del cron.
+    - cron: '7 17 * * 0'
   workflow_dispatch:
 
 jobs:
