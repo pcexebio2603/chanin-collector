@@ -114,14 +114,17 @@ const SELECCION = `
       AND p.cur_online IS NOT NULL
       AND p.cur_online >= ${PISO_CENTIMOS}
       AND p.cur_online < MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) * (1 - ${CAIDA_MIN})
-      -- Sólo precios que fija la propia tienda. En Falabella se EXIGE primera parte; no vale
-      -- con "seller IS NULL", porque 385k productos suyos llevan corridas sin volver a verse y
-      -- también tienen el vendedor a nulo: colarían como si fueran de Falabella. Los retailers
-      -- VTEX no tienen el concepto de vendedor y pasan sin más.
+      -- Sólo precios que fija la propia tienda. En Falabella, un vendedor nulo NO significa
+      -- "es de Falabella": son 385k productos que llevan corridas sin volver a verse (los topes
+      -- de página dejan fuera la cola larga de cada categoría). Antes se les cerraba la puerta
+      -- aquí, y eso dejaba fuera producto de primera parte legítimo — Pablo trajo varios casos.
+      -- Ahora pasan como DESCONOCIDOS y su vendedor se resuelve leyendo la ficha, que de todas
+      -- formas ya descargamos para verificar stock. Los retailers VTEX pasan sin más.
       -- De aquí salen dos de los tres patrones de descuento fantasma de 04 §8 (lista inflada de
       -- marketplace y ancla fija de seller); el tercero, el placeholder de S/9,899, es de
       -- Promart y Oechsle, así que este filtro NO lo toca.
       AND (p.retailer <> ${RETAILERS.falabella.id}
+           OR p.seller IS NULL
            OR p.seller = (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}'))
   ),
   centinelas AS (
@@ -160,7 +163,7 @@ const cands = REVERIFICAR ? [] : await query(`
     SELECT product_fk, MAX(ts) AS bajo FROM trans
     WHERE ant IS NOT NULL AND price_online < ant GROUP BY product_fk
   )
-  SELECT c.id, c.ref, c.cur_online, c.caida, p.retailer, p.sku, p.product_id, p.slug, b.bajo
+  SELECT c.id, c.ref, c.cur_online, c.caida, p.retailer, p.sku, p.product_id, p.slug, p.seller, b.bajo
   FROM cand c
   JOIN products p       ON p.id = c.id
   LEFT JOIN bajada b    ON b.product_fk = c.id
@@ -263,6 +266,9 @@ const CONCURRENCIA = 5;
 // Si el marcado cambia y no se puede parsear, se vuelve al comportamiento anterior (sólo mirar
 // que no sea un 404) y se registra. Un cambio de maquetación no puede vaciar el carrusel.
 let falaSinParsear = 0;
+let falaAjenos = 0;
+// sku → sellerId leído de la ficha, para rellenar products.seller y no repetir el trabajo.
+const sellerResuelto = new Map();
 
 function precioDeVariante(v) {
   const por = {};
@@ -274,7 +280,7 @@ function precioDeVariante(v) {
   return online.length ? Math.min(...online) : null;
 }
 
-async function viva(url, sku, precioEsperado) {
+async function viva(url, sku, precioEsperado, vendedorConocido) {
   try {
     const res = await fetch(url, {
       redirect: 'follow',
@@ -286,10 +292,24 @@ async function viva(url, sku, precioEsperado) {
 
     const html = await res.text();
     const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
-    if (!m) { falaSinParsear++; return true; }
+    // Si no se puede parsear y encima NO sabíamos de quién era el producto, se descarta: de los
+    // 213 candidatos con vendedor desconocido, 189 (89%) resultaron ser de terceros. Aceptar a
+    // ciegas es apostar a uno contra nueve. Con vendedor ya conocido sí se acepta: el fallo de
+    // parseo no debe castigar a un producto que ya sabemos que es de la tienda.
+    if (!m) { falaSinParsear++; return !!vendedorConocido; }
     const pd = JSON.parse(m[1])?.props?.pageProps?.productData;
     const v = pd?.variants?.find((x) => String(x.id) === String(sku)) ?? pd?.variants?.[0];
-    if (!v) { falaSinParsear++; return true; }
+    if (!v) { falaSinParsear++; return !!vendedorConocido; }
+
+    // Vendedor: la ficha lo trae aunque el listado no lo haya vuelto a ver.
+    const vendedor = v.offerings?.[0]?.sellerId ?? pd.sellerInfo?.sellerId ?? null;
+    if (vendedor) {
+      sellerResuelto.set(String(sku), vendedor);
+      if (vendedor !== FALABELLA_PRIMERA_PARTE) { falaAjenos++; return false; }
+    } else if (!vendedorConocido) {
+      falaSinParsear++;
+      return false; // desconocido y la ficha tampoco lo dice: no se publica a ciegas
+    }
 
     if (v.isPurchaseable === false || pd.isOutOfStock === true) return false;
     const precio = precioDeVariante(v);
@@ -302,7 +322,7 @@ async function viva(url, sku, precioEsperado) {
 
 if (REVERIFICAR) {
   const pub = await query(`
-    SELECT o.product_fk AS id, o.precio AS cur_online, p.retailer, p.sku, p.product_id, p.slug
+    SELECT o.product_fk AS id, o.precio AS cur_online, p.retailer, p.sku, p.product_id, p.slug, p.seller
     FROM ofertas o JOIN products p ON p.id = o.product_fk
   `);
   log(`[reverificar] ${pub.length} ofertas publicadas`);
@@ -317,7 +337,7 @@ if (REVERIFICAR) {
   for (let i = 0; i < fala.length; i += CONCURRENCIA) {
     const trozo = fala.slice(i, i + CONCURRENCIA);
     const res = await Promise.all(trozo.map((c) =>
-      viva(decodeUrl(BY_ID[c.retailer], c.product_id, c.slug), c.sku, c.cur_online)));
+      viva(decodeUrl(BY_ID[c.retailer], c.product_id, c.slug), c.sku, c.cur_online, c.seller)));
     res.forEach((ok, j) => { if (!ok) caducadas.push(trozo[j].id); });
     await new Promise((r) => setTimeout(r, 250));
   }
@@ -329,6 +349,25 @@ if (REVERIFICAR) {
   }
   log(`[reverificar] ${caducadas.length} retiradas por agotarse o cambiar de precio; quedan ${pub.length - caducadas.length}`);
   process.exit(0);
+}
+
+
+// Rellena products.seller con lo leído de las fichas. Así un producto que el listado dejó de
+// mostrar deja de ser "desconocido" para siempre: la próxima corrida ya sabe de quién es y no
+// hay que volver a abrir su ficha. El coste se paga una vez y decrece solo.
+async function guardarSellers() {
+  if (!sellerResuelto.size) return;
+  const dic = new Map((await query('SELECT id, name FROM sellers')).map((r) => [r.name, r.id]));
+  const nuevos = [...new Set([...sellerResuelto.values()].filter((v) => !dic.has(v)))];
+  if (nuevos.length) {
+    for (const n of nuevos) await exec(`INSERT OR IGNORE INTO sellers (name) VALUES ('${n.replace(/'/g, "''")}')`);
+    for (const r of await query('SELECT id, name FROM sellers')) dic.set(r.name, r.id);
+  }
+  const fila = RETAILERS.falabella.id;
+  const stmts = [...sellerResuelto].map(([sku, v]) =>
+    `UPDATE products SET seller=${dic.get(v) ?? 'NULL'} WHERE retailer=${fila} AND sku='${String(sku).replace(/'/g, "''")}'`);
+  for (let i = 0; i < stmts.length; i += 25) await exec(stmts.slice(i, i + 25).join(';\n') + ';');
+  log(`[ofertas] vendedor resuelto y guardado en ${stmts.length} productos que el listado ya no muestra`);
 }
 
 // Cada tienda se verifica con lo que expone: VTEX por su API de catálogo, Falabella leyendo el
@@ -347,13 +386,16 @@ for (let i = 0; i < fala.length; i += CONCURRENCIA) {
   const trozo = fala.slice(i, i + CONCURRENCIA);
   const res = await Promise.all(trozo.map((c) => {
     const r = BY_ID[c.retailer];
-    return viva(decodeUrl(r, c.product_id, c.slug), c.sku, c.cur_online);
+    return viva(decodeUrl(r, c.product_id, c.slug), c.sku, c.cur_online, c.seller);
   }));
   res.forEach((ok, j) => (ok ? vivas.push(trozo[j]) : muertas++));
   await new Promise((r) => setTimeout(r, 250));
 }
+await guardarSellers();
 log(`[ofertas] Falabella: ${fala.length - muertas} de ${fala.length} siguen comprables y al mismo precio` +
-    (falaSinParsear ? ` (${falaSinParsear} sin poder parsear la ficha, aceptadas por defecto)` : ''));
+    (falaAjenos ? `; ${falaAjenos} descartadas por ser de terceros (vendedor resuelto en la ficha)` : '') +
+    (falaSinParsear ? ` (${falaSinParsear} con la ficha ilegible: se aceptan si ya sabíamos que` +
+      ` eran de Falabella y se descartan si no)` : ''));
 
 // El guardián revisa lo que ha sobrevivido y aparta lo que se contradice consigo mismo.
 const { limpias, motivos, canarios } = await revisar(vivas);

@@ -104,13 +104,18 @@ for (const f of filas) {
   if (f.cur_stock !== 1) { no('Sin stock la última vez que lo vimos — sin stock no es oferta.'); continue; }
   ok('Con stock.');
 
-  // 2. vendedor
-  if (r.name === 'falabella' && f.vendedor !== FALABELLA_PRIMERA_PARTE) {
-    no(`Lo vende "${f.vendedor ?? 'no lo hemos vuelto a ver'}", no Falabella.`);
+  // 2. vendedor. Un vendedor nulo NO descalifica: significa que el listado dejó de mostrarlo y
+  // aún no sabemos de quién es. Se resuelve leyendo su ficha durante la verificación en vivo.
+  if (r.name === 'falabella' && f.vendedor && f.vendedor !== FALABELLA_PRIMERA_PARTE) {
+    no(`Lo vende "${f.vendedor}", no Falabella.`);
     nota('Sólo rastreamos lo que fija la propia tienda; Tottus y Sodimac también quedan fuera.');
     continue;
   }
-  ok(r.name === 'falabella' ? 'Lo vende Falabella (primera parte).' : 'Retailer sin marketplace.');
+  if (r.name === 'falabella' && !f.vendedor) {
+    ok('Vendedor aún desconocido (el listado dejó de mostrarlo); se resuelve al verificar la ficha.');
+  } else {
+    ok(r.name === 'falabella' ? 'Lo vende Falabella (primera parte).' : 'Retailer sin marketplace.');
+  }
 
   // 3. piso de precio
   if (f.cur_online < PISO_CENTIMOS) {
