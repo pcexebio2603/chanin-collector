@@ -54,6 +54,10 @@ import { revisar, registrar, resumen } from './guardian.js';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 const VER = process.argv.includes('--ver');
+// --reverificar: NO recalcula candidatas. Coge lo ya publicado y sólo comprueba que siga vivo,
+// para que el carrusel no arrastre medio día una oferta agotada. La verificación de la corrida
+// completa es una foto del momento; esto la refresca sin repetir el trabajo caro.
+const REVERIFICAR = process.argv.includes('--reverificar');
 
 const DIAS_VENTANA = 90;      // historia que entra en la mediana; hoy sobra, en octubre no
 const CAIDA_MIN = 0.30;
@@ -145,7 +149,7 @@ await exec(`
 // `bajo` = cuándo se produjo la última bajada REAL de precio. No vale con el último cambio a
 // secas: un producto que subió un poco pero sigue por debajo de su referencia diría "bajó hace
 // X" siendo falso. Se compara cada punto con el anterior y se busca el último descenso.
-const cands = await query(`
+const cands = REVERIFICAR ? [] : await query(`
   WITH cand AS (${SELECCION}),
   trans AS (
     SELECT product_fk, ts, price_online,
@@ -161,7 +165,7 @@ const cands = await query(`
   JOIN products p       ON p.id = c.id
   LEFT JOIN bajada b    ON b.product_fk = c.id
 `);
-log(`[ofertas] ${cands.length} candidatas tras el filtro de credibilidad`);
+if (!REVERIFICAR) log(`[ofertas] ${cands.length} candidatas tras el filtro de credibilidad`);
 
 // ---------------------------------------------------------------------------------------------
 // VERIFICACIÓN CONTRA LA TIENDA, ANTES DE PUBLICAR
@@ -294,6 +298,37 @@ async function viva(url, sku, precioEsperado) {
   } catch {
     return true; // ante un fallo de red no castigamos al producto: se revisa en la próxima corrida
   }
+}
+
+if (REVERIFICAR) {
+  const pub = await query(`
+    SELECT o.product_fk AS id, o.precio AS cur_online, p.retailer, p.sku, p.product_id, p.slug
+    FROM ofertas o JOIN products p ON p.id = o.product_fk
+  `);
+  log(`[reverificar] ${pub.length} ofertas publicadas`);
+  if (!pub.length) process.exit(0);
+
+  const okVtex = await verificarVtex(pub);
+  const esFala = (c) => BY_ID[c.retailer].name === 'falabella';
+  const caducadas = [];
+  for (const c of pub.filter((x) => !esFala(x))) if (!okVtex.has(c.id)) caducadas.push(c.id);
+
+  const fala = pub.filter(esFala);
+  for (let i = 0; i < fala.length; i += CONCURRENCIA) {
+    const trozo = fala.slice(i, i + CONCURRENCIA);
+    const res = await Promise.all(trozo.map((c) =>
+      viva(decodeUrl(BY_ID[c.retailer], c.product_id, c.slug), c.sku, c.cur_online)));
+    res.forEach((ok, j) => { if (!ok) caducadas.push(trozo[j].id); });
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  if (caducadas.length) {
+    for (let i = 0; i < caducadas.length; i += 50) {
+      await exec(`DELETE FROM ofertas WHERE product_fk IN (${caducadas.slice(i, i + 50).join(',')});`);
+    }
+  }
+  log(`[reverificar] ${caducadas.length} retiradas por agotarse o cambiar de precio; quedan ${pub.length - caducadas.length}`);
+  process.exit(0);
 }
 
 // Cada tienda se verifica con lo que expone: VTEX por su API de catálogo, Falabella leyendo el
