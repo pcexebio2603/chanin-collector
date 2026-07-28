@@ -36,3 +36,8 @@ jobs:
             node collect.js
             node falabella/collect-falabella.js
           fi
+      # Caza Precio: recalcula la tabla `ofertas` con los precios recién recogidos. Va aquí y no
+      # en el Worker porque escanear los price_points es caro; así servir el carrusel es una
+      # lectura trivial. Se recalcula entero cada corrida: una oferta vive 1-3 días.
+      - name: Recalcular ofertas (Caza Precio)
+        run: node ofertas.js --ver
