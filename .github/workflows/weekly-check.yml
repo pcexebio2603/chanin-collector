@@ -21,5 +21,9 @@ jobs:
         with:
           node-version: '20'
       # Sin npm install: el chequeo solo usa d1-client.js (fetch nativo de Node 20).
+      # La auditoría va PRIMERO y con `always()` más abajo no haría falta, pero así se ejecuta
+      # aunque el chequeo acabe en WARN: interesa el número incluso —sobre todo— cuando algo va mal.
+      - name: Auditoría del detector de ofertas
+        run: node auditoria.js --dias 7
       - name: Chequeo semanal → D1
         run: node weekly-check-d1.js

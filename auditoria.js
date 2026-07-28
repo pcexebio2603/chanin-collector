@@ -1,0 +1,181 @@
+// Auto-auditoría de Caza Precio: ¿las ofertas que publicamos eran de verdad?
+//
+// Uso: CLOUDFLARE_API_TOKEN=... node auditoria.js [--dias 7]
+//
+// EL MÉTODO. No guardamos un histórico de lo publicado (la tabla `ofertas` se recalcula entera
+// en cada corrida), así que la auditoría no espera: RETRO-SIMULA. Se elige un corte T hace N
+// días, se calcula qué habría publicado el detector usando SÓLO los datos que existían hasta T,
+// y después se mira qué hizo el precio a partir de T.
+//
+// LA MÉTRICA. Una rebaja de verdad es temporal: el precio vuelve a subir (el análisis del
+// 2026-07-24 midió una vida útil de 1-3 días). Si tras publicarla el precio NUNCA regresa cerca
+// de la referencia, lo más probable es que esa referencia no fuera el precio habitual del
+// producto — que es exactamente el fallo del caso Puma. Así que la tasa de retorno mide si
+// nuestras referencias son precios reales.
+//
+// Se calcula para el algoritmo ACTUAL (mediana ponderada) y para el ANTERIOR (máximo sostenido)
+// sobre el mismo corte, de modo que la mejora se demuestra en vez de suponerse.
+//
+// LÍMITE HONESTO: con ~15 días de historial el corte deja ~8 días antes y 7 después. Una
+// liquidación larga y legítima puede no haber vuelto todavía y cuenta como "no volvió", así que
+// la tasa es un SUELO, no una medida exacta. Mejora sola conforme se acumule historial.
+import { query } from './d1-client.js';
+import { FALABELLA_PRIMERA_PARTE, RETAILERS } from './schema-v2.js';
+
+const argOf = (f) => { const i = process.argv.indexOf(f); return i >= 0 ? process.argv[i + 1] : undefined; };
+const DIAS = Number(argOf('--dias') ?? 7);
+
+const CAIDA_MIN = 0.30;
+const CAIDA_MAX = 0.85;
+const PISO_CENTIMOS = 10000;
+const DIAS_SOSTENIDO = 3;     // el umbral del algoritmo VIEJO, para poder compararlo
+const VUELTA = 0.90;          // se considera que volvió si recupera el 90% de la referencia
+
+const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
+
+// Candidatos en el corte T, con la referencia según cada algoritmo.
+// `dur` se recorta en T: un punto vigente al llegar el corte no puede "durar" más allá de él.
+const SQL_CANDIDATOS = `
+  WITH corte AS (SELECT strftime('%s','now') - ${DIAS} * 86400 AS t),
+  pts AS (
+    SELECT pp.product_fk, pp.price_online, pp.ts, pp.in_stock,
+           MIN(COALESCE(LEAD(pp.ts) OVER (PARTITION BY pp.product_fk ORDER BY pp.ts),
+                        (SELECT t FROM corte)), (SELECT t FROM corte)) - pp.ts AS dur
+    FROM price_points pp
+    WHERE pp.ts <= (SELECT t FROM corte)
+  ),
+  acum AS (
+    SELECT product_fk, price_online, dur,
+           SUM(dur) OVER (PARTITION BY product_fk ORDER BY price_online
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hasta_aqui,
+           SUM(dur) OVER (PARTITION BY product_fk) AS total
+    FROM pts
+  ),
+  ref_nueva AS (   -- mediana ponderada por tiempo
+    SELECT product_fk, MIN(price_online) AS ref
+    FROM acum WHERE total > 0 AND hasta_aqui >= total / 2.0
+    GROUP BY product_fk
+  ),
+  ref_vieja AS (   -- máximo entre los precios que estuvieron vigentes >= 3 días
+    SELECT product_fk, MAX(price_online) AS ref
+    FROM pts WHERE dur >= ${DIAS_SOSTENIDO} * 86400
+    GROUP BY product_fk
+  ),
+  estado_en_t AS ( -- precio y stock vigentes justo en el corte
+    SELECT product_fk, price_online, in_stock FROM (
+      SELECT product_fk, price_online, in_stock,
+             ROW_NUMBER() OVER (PARTITION BY product_fk ORDER BY ts DESC) rk
+      FROM pts
+    ) WHERE rk = 1
+  )
+  SELECT e.product_fk, e.price_online AS precio_t, n.ref AS ref_nueva, v.ref AS ref_vieja
+  FROM estado_en_t e
+  JOIN products p       ON p.id = e.product_fk
+  LEFT JOIN ref_nueva n ON n.product_fk = e.product_fk
+  LEFT JOIN ref_vieja v ON v.product_fk = e.product_fk
+  WHERE e.in_stock = 1
+    AND e.price_online >= ${PISO_CENTIMOS}
+    AND (p.retailer <> ${RETAILERS.falabella.id}
+         OR p.seller = (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}'))
+    AND (n.ref IS NOT NULL OR v.ref IS NOT NULL)
+`;
+
+// Qué hizo el precio DESPUÉS del corte: el máximo alcanzado.
+const SQL_DESPUES = `
+  WITH corte AS (SELECT strftime('%s','now') - ${DIAS} * 86400 AS t)
+  SELECT product_fk, MAX(price_online) AS max_despues
+  FROM price_points
+  WHERE ts > (SELECT t FROM corte)
+  GROUP BY product_fk
+`;
+
+log(`[auditoría] corte hace ${DIAS} días; simulando qué se habría publicado entonces…`);
+const candidatos = await query(SQL_CANDIDATOS);
+const despues = new Map((await query(SQL_DESPUES)).map((r) => [r.product_fk, r.max_despues]));
+log(`[auditoría] ${candidatos.length.toLocaleString('es-PE')} productos con precio y stock en el corte`);
+
+function evaluar(nombre, refDe) {
+  const publicadas = [];
+  for (const c of candidatos) {
+    const ref = refDe(c);
+    if (ref == null) continue;
+    const caida = 1 - c.precio_t / ref;
+    if (caida < CAIDA_MIN || caida > CAIDA_MAX) continue;
+    publicadas.push({ ...c, ref, caida });
+  }
+  let volvieron = 0, sinDatoPosterior = 0;
+  for (const o of publicadas) {
+    const mx = despues.get(o.product_fk);
+    if (mx == null) { sinDatoPosterior++; continue; }
+    if (mx >= o.ref * VUELTA) volvieron++;
+  }
+  // Sin cambios posteriores = el precio siguió donde estaba, o sea NO volvió.
+  const evaluables = publicadas.length;
+  const pct = evaluables ? (volvieron / evaluables * 100) : 0;
+  console.log(
+    `  ${nombre.padEnd(26)} publicadas: ${String(publicadas.length).padStart(5)}` +
+    `  ·  volvieron a su referencia: ${String(volvieron).padStart(5)} (${pct.toFixed(1)}%)` +
+    `  ·  sin cambios después: ${sinDatoPosterior}`
+  );
+  return { nombre, publicadas: publicadas.length, volvieron, pct, lista: publicadas };
+}
+
+console.log('\n— ¿volvió el precio a su referencia? —');
+const nueva = evaluar('mediana ponderada (hoy)', (c) => c.ref_nueva);
+const vieja = evaluar('máximo sostenido (antes)', (c) => c.ref_vieja);
+
+// ---------------------------------------------------------------------------------------------
+// SEGUNDA MÉTRICA: ¿CUÁNTO AGUANTÓ LA REFERENCIA?
+//
+// La primera no discrimina, y hay que decirlo: con 15 días de historial la mayoría de productos
+// no cambia de precio en la ventana posterior, así que "¿volvió?" queda sin respuesta para el
+// grueso de la muestra y el resultado se lo come el ruido.
+//
+// Ésta mide directamente el fallo del caso Puma: qué fracción del tiempo observado el producto
+// estuvo REALMENTE en su precio de referencia (o por encima). Una referencia legítima es un
+// precio que el producto sostuvo; una inventada es un pico de tres días. No hace falta esperar
+// a que pase nada después, así que usa toda la historia disponible.
+// ---------------------------------------------------------------------------------------------
+async function aguante(publicadas, etiqueta) {
+  if (!publicadas.length) return;
+  const ids = publicadas.map((p) => p.product_fk);
+  const filas = await query(`
+    WITH corte AS (SELECT strftime('%s','now') - ${DIAS} * 86400 AS t)
+    SELECT product_fk, price_online,
+           MIN(COALESCE(LEAD(ts) OVER (PARTITION BY product_fk ORDER BY ts),
+                        (SELECT t FROM corte)), (SELECT t FROM corte)) - ts AS dur
+    FROM price_points
+    WHERE ts <= (SELECT t FROM corte) AND product_fk IN (${ids.join(',')})
+  `);
+  const porProducto = new Map();
+  for (const f of filas) {
+    if (!porProducto.has(f.product_fk)) porProducto.set(f.product_fk, []);
+    porProducto.get(f.product_fk).push(f);
+  }
+  const fracciones = [];
+  for (const p of publicadas) {
+    const pts = porProducto.get(p.product_fk) ?? [];
+    const total = pts.reduce((a, x) => a + Math.max(0, x.dur), 0);
+    if (!total) continue;
+    const enRef = pts.reduce((a, x) => a + (x.price_online >= p.ref * 0.9 ? Math.max(0, x.dur) : 0), 0);
+    fracciones.push(enRef / total);
+  }
+  fracciones.sort((a, b) => a - b);
+  const media = fracciones.reduce((a, b) => a + b, 0) / fracciones.length;
+  const mediana = fracciones[Math.floor(fracciones.length / 2)];
+  const frágiles = fracciones.filter((f) => f < 0.5).length;
+  console.log(
+    `  ${etiqueta.padEnd(26)} tiempo en la referencia → media ${(media * 100).toFixed(0)}%` +
+    ` · mediana ${(mediana * 100).toFixed(0)}%` +
+    ` · referencias débiles (vigentes <50% del tiempo): ${frágiles} de ${fracciones.length}` +
+    ` (${(frágiles / fracciones.length * 100).toFixed(0)}%)`
+  );
+}
+
+console.log('\n— ¿cuánto tiempo estuvo vigente esa referencia? —');
+await aguante(nueva.lista, 'mediana ponderada (hoy)');
+await aguante(vieja.lista, 'máximo sostenido (antes)');
+
+console.log('');
+log(`[auditoría] la primera métrica no discrimina con ${DIAS} días de ventana posterior: la mayoría`);
+log(`[auditoría] de productos no cambia de precio en ese plazo. La segunda sí, y no necesita esperar.`);
