@@ -21,16 +21,40 @@
 // valor se repita — S/299 lo comparten 11 productos y es un precio legítimo. Lo que delata al
 // centinela es repetirse Y que la caída media que produce sea desproporcionada.
 //
+// POR QUÉ LA REFERENCIA YA NO ES EL MÁXIMO (2026-07-28)
+//
+// Usar el máximo sostenido premiaba exactamente la manipulación que este producto denuncia:
+// subir el precio unos días para poder anunciar después un descuento enorme. Caso real que lo
+// destapó — zapatillas Puma Court Lally de Falabella (sku 21386335):
+//
+//     14-jul  S/129   6.1 días   45% del tiempo
+//     20-jul  S/616   3.5 días   26%     ← pico; superaba el umbral de "sostenido"
+//     24-jul  S/169   4.0 días   29%     ← precio actual
+//
+// El carrusel las anunciaba como "de S/616 a S/169", un 73% de descuento inventado: su precio
+// habitual ronda los S/129-169. El máximo es justo el estadístico más frágil ante un pico.
+//
+// La referencia es ahora la MEDIANA PONDERADA POR TIEMPO: el precio por debajo del cual el
+// producto pasó la mitad de su vida. Para las Puma da S/169 — su precio actual — así que la
+// caída es 0% y desaparecen. Un pico corto ya no puede fijar la referencia por sí solo.
+//
+// Efecto secundario deseable: si un precio rebajado se sostiene más tiempo que el anterior,
+// pasa a ser la referencia y el producto deja de anunciarse como oferta. Es correcto: a esas
+// alturas ya no es una rebaja, es su precio nuevo.
+//
 // La banda se corta en 85%: por encima, todo lo inspeccionado era fantasma. Ahí es donde viviría
 // la categoría "posible error de precio" de §8 (el caso Makita S/799→39), pero necesita más
 // evidencia que la que hoy da un historial de dos semanas — publicar un 96% inventado sería
 // justo lo contrario de la promesa de marca. Queda para una v2.
 // ---------------------------------------------------------------------------------------------
 import { query, exec } from './d1-client.js';
+import { BY_ID, decodeUrl } from './schema-v2.js';
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 const VER = process.argv.includes('--ver');
 
-const DIAS_SOSTENIDO = 3;     // el precio de referencia tuvo que estar vigente al menos esto
+const DIAS_VENTANA = 90;      // historia que entra en la mediana; hoy sobra, en octubre no
 const CAIDA_MIN = 0.30;
 const CAIDA_MAX = 0.85;       // por encima domina el fantasma; ver cabecera
 const PISO_CENTIMOS = 10000;  // S/100: por debajo el ruido se come la señal
@@ -40,16 +64,26 @@ const CENTINELA_CAIDA = 0.88;     // …y con caída media de este orden, es un 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 
 // Duración real de cada punto: como sólo guardamos cambios, un punto rige hasta el siguiente.
+// La mediana ponderada = el precio más bajo cuya duración acumulada (ordenando de menor a mayor)
+// alcanza la mitad del tiempo total observado.
 const SELECCION = `
   WITH pts AS (
-    SELECT product_fk, ts, price_online,
-           LEAD(ts) OVER (PARTITION BY product_fk ORDER BY ts) AS ts_sig
+    SELECT product_fk, price_online,
+           COALESCE(LEAD(ts) OVER (PARTITION BY product_fk ORDER BY ts), strftime('%s','now')) - ts AS dur
     FROM price_points
+    WHERE ts >= strftime('%s','now') - ${DIAS_VENTANA} * 86400
+  ),
+  acum AS (
+    SELECT product_fk, price_online,
+           SUM(dur) OVER (PARTITION BY product_fk ORDER BY price_online
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hasta_aqui,
+           SUM(dur) OVER (PARTITION BY product_fk) AS total
+    FROM pts
   ),
   sostenidos AS (
-    SELECT product_fk, MAX(price_online) AS ref
-    FROM pts
-    WHERE (COALESCE(ts_sig, strftime('%s','now')) - ts) >= ${DIAS_SOSTENIDO} * 86400
+    SELECT product_fk, MIN(price_online) AS ref
+    FROM acum
+    WHERE total > 0 AND hasta_aqui >= total / 2.0
     GROUP BY product_fk
   ),
   cand AS (
@@ -81,19 +115,73 @@ await exec(`
   CREATE INDEX IF NOT EXISTS idx_ofertas_caida ON ofertas(caida DESC);
 `);
 
+// Candidatas, con lo justo para reconstruir su url y poder comprobarla.
+const cands = await query(`
+  SELECT c.id, c.ref, c.cur_online, c.caida, p.retailer, p.product_id, p.slug
+  FROM (${SELECCION}) c JOIN products p ON p.id = c.id
+`);
+log(`[ofertas] ${cands.length} candidatas tras el filtro de credibilidad`);
+
+// ---------------------------------------------------------------------------------------------
+// PRODUCTOS MUERTOS
+// Un producto puede seguir en nuestra base con precio y stock y aun así llevar a un 404: la
+// tienda lo descatalogó o le cambió el slug (caso real: la Torre de Sonido Samsung de Oechsle
+// acababa en /Sistema/404?ProductLinkNotFound=...). Publicar eso quema la confianza de un
+// visitante en su primer clic.
+//
+// `last_checked` NO sirve para detectarlo: sólo se actualiza cuando el precio CAMBIA, así que
+// hoy apenas 19k de 794k productos lo tienen fresco (comprobado el 2026-07-28).
+//
+// Por eso se comprueban las urls por HTTP, pero SÓLO las candidatas (~1k), no el catálogo
+// entero: es la diferencia entre un minuto y un día de peticiones. Rate limit respetuoso y
+// concurrencia baja, en la línea del resto del colector.
+// ---------------------------------------------------------------------------------------------
+const MUERTA = /\/Sistema\/404|ProductLinkNotFound|pagina-no-encontrada|not-?found/i;
+const CONCURRENCIA = 5;
+
+async function viva(url) {
+  try {
+    const res = await fetch(url, {
+      redirect: 'follow',
+      headers: { 'User-Agent': UA },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.status >= 400) return false;
+    return !MUERTA.test(res.url); // la tienda puede responder 200 tras redirigir a su página de 404
+  } catch {
+    return true; // ante un fallo de red no castigamos al producto: se revisa en la próxima corrida
+  }
+}
+
+const vivas = [];
+let muertas = 0;
+for (let i = 0; i < cands.length; i += CONCURRENCIA) {
+  const trozo = cands.slice(i, i + CONCURRENCIA);
+  const res = await Promise.all(trozo.map((c) => {
+    const r = BY_ID[c.retailer];
+    return viva(decodeUrl(r, c.product_id, c.slug));
+  }));
+  res.forEach((ok, j) => (ok ? vivas.push(trozo[j]) : muertas++));
+  await new Promise((r) => setTimeout(r, 250));
+}
+log(`[ofertas] ${muertas} descartadas por llevar a una página muerta`);
+
 // Recalculado entero en cada corrida: la vida útil de una oferta es de 1-3 días (verificado en
 // el análisis del 2026-07-24), así que arrastrar las viejas mostraría precios que ya no existen.
 const ahora = Math.floor(Date.now() / 1000);
-await exec(`
-  DELETE FROM ofertas;
-  INSERT INTO ofertas (product_fk, ref, precio, caida, calculado)
-  SELECT id, ref, cur_online, caida, ${ahora} FROM (${SELECCION});
-`);
+await exec('DELETE FROM ofertas;');
+for (let i = 0; i < vivas.length; i += 25) {
+  const trozo = vivas.slice(i, i + 25);
+  await exec(trozo.map((c) =>
+    `INSERT INTO ofertas (product_fk, ref, precio, caida, calculado) ` +
+    `VALUES (${c.id},${c.ref},${c.cur_online},${c.caida},${ahora})`
+  ).join(';\n') + ';');
+}
 
 const [{ n, prof }] = await query(
   `SELECT COUNT(*) n, SUM(caida >= 0.5) prof FROM ofertas`
 );
-log(`[ofertas] ${n} ofertas creíbles (${prof ?? 0} con caída >=50%)`);
+log(`[ofertas] ${n} ofertas publicables (${prof ?? 0} con caída >=50%)`);
 
 if (VER) {
   const top = await query(`
