@@ -126,10 +126,75 @@ await exec(`
 
 // Candidatas, con lo justo para reconstruir su url y poder comprobarla.
 const cands = await query(`
-  SELECT c.id, c.ref, c.cur_online, c.caida, p.retailer, p.product_id, p.slug
+  SELECT c.id, c.ref, c.cur_online, c.caida, p.retailer, p.sku, p.product_id, p.slug
   FROM (${SELECCION}) c JOIN products p ON p.id = c.id
 `);
 log(`[ofertas] ${cands.length} candidatas tras el filtro de credibilidad`);
+
+// ---------------------------------------------------------------------------------------------
+// VERIFICACIÓN CONTRA LA TIENDA, ANTES DE PUBLICAR
+//
+// El estado que guardamos es el del último día que VIMOS el producto, y un producto que
+// desaparece del listado se queda fosilizado ahí para siempre. Caso real (2026-07-28): el
+// BookCover Samsung de Plaza Vea salía en el carrusel a S/249 con stock cuando la tienda ya lo
+// daba AGOTADO a S/499. La comprobación de url no lo pilla: la ficha existe y responde 200.
+//
+// Medido sobre las ofertas publicadas ese día: 3 de 75 VTEX (4%) estaban agotadas. Poco, pero
+// inaceptable cuando toda la promesa de la página es no mentir — y le tocó al primer producto
+// que abrió Pablo.
+//
+// Para VTEX se consulta la API de catálogo, que da precio y disponibilidad reales y admite
+// varios SKUs por llamada (verificado): las ~450 ofertas se comprueban en una docena de
+// peticiones. Si el precio ya no coincide, tampoco se publica: significa que nuestro dato está
+// viejo, y la próxima corrida lo recogerá bien.
+// ---------------------------------------------------------------------------------------------
+const HOST_VTEX = {
+  oechsle: 'https://www.oechsle.pe',
+  plazavea: 'https://www.plazavea.com.pe',
+  promart: 'https://www.promart.pe',
+};
+const POR_LOTE = 40;
+
+async function verificarVtex(lista) {
+  const buenos = new Set();
+  const porTienda = new Map();
+  for (const c of lista) {
+    const t = BY_ID[c.retailer].name;
+    if (!HOST_VTEX[t]) continue;
+    if (!porTienda.has(t)) porTienda.set(t, []);
+    porTienda.get(t).push(c);
+  }
+  for (const [tienda, cands] of porTienda) {
+    for (let i = 0; i < cands.length; i += POR_LOTE) {
+      const lote = cands.slice(i, i + POR_LOTE);
+      const fq = lote.map((c) => `fq=skuId:${encodeURIComponent(c.sku)}`).join('&');
+      try {
+        const res = await fetch(`${HOST_VTEX[tienda]}/api/catalog_system/pub/products/search?${fq}&_from=0&_to=49`, {
+          headers: { 'User-Agent': UA, Accept: 'application/json' },
+          signal: AbortSignal.timeout(25000),
+        });
+        const prods = await res.json();
+        const vivos = new Map();
+        for (const p of prods ?? []) {
+          for (const it of p.items ?? []) {
+            const of = it.sellers?.[0]?.commertialOffer;
+            if (of) vivos.set(String(it.itemId), of);
+          }
+        }
+        for (const c of lote) {
+          const of = vivos.get(String(c.sku));
+          if (!of || !of.IsAvailable || !(of.AvailableQuantity > 0)) continue;
+          if (Math.abs(Math.round(of.Price * 100) - c.cur_online) > 50) continue; // nuestro precio ya no vale
+          buenos.add(c.id);
+        }
+      } catch {
+        for (const c of lote) buenos.add(c.id); // fallo de red: no castigamos, se revisa mañana
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  return buenos;
+}
 
 // ---------------------------------------------------------------------------------------------
 // PRODUCTOS MUERTOS
@@ -162,10 +227,20 @@ async function viva(url) {
   }
 }
 
-const vivas = [];
+// VTEX se verifica contra su API de catálogo (precio y stock reales, y de paso descarta lo
+// descatalogado). Falabella no tiene endpoint por SKU, así que se queda con la comprobación de
+// url — pilla los 404 pero no un "agotado", que es una limitación conocida y anotada.
+const okVtex = await verificarVtex(cands);
+const esFala = (c) => BY_ID[c.retailer].name === 'falabella';
+const vtex = cands.filter((c) => !esFala(c));
+const fala = cands.filter(esFala);
+
+const vivas = vtex.filter((c) => okVtex.has(c.id));
+log(`[ofertas] VTEX: ${vivas.length} de ${vtex.length} siguen con el mismo precio y con stock`);
+
 let muertas = 0;
-for (let i = 0; i < cands.length; i += CONCURRENCIA) {
-  const trozo = cands.slice(i, i + CONCURRENCIA);
+for (let i = 0; i < fala.length; i += CONCURRENCIA) {
+  const trozo = fala.slice(i, i + CONCURRENCIA);
   const res = await Promise.all(trozo.map((c) => {
     const r = BY_ID[c.retailer];
     return viva(decodeUrl(r, c.product_id, c.slug));
@@ -173,7 +248,7 @@ for (let i = 0; i < cands.length; i += CONCURRENCIA) {
   res.forEach((ok, j) => (ok ? vivas.push(trozo[j]) : muertas++));
   await new Promise((r) => setTimeout(r, 250));
 }
-log(`[ofertas] ${muertas} descartadas por llevar a una página muerta`);
+log(`[ofertas] Falabella: ${muertas} descartadas por llevar a una página muerta`);
 
 // Recalculado entero en cada corrida: la vida útil de una oferta es de 1-3 días (verificado en
 // el análisis del 2026-07-24), así que arrastrar las viejas mostraría precios que ya no existen.
