@@ -48,7 +48,7 @@
 // justo lo contrario de la promesa de marca. Queda para una v2.
 // ---------------------------------------------------------------------------------------------
 import { query, exec } from './d1-client.js';
-import { BY_ID, decodeUrl, FALABELLA_PRIMERA_PARTE } from './schema-v2.js';
+import { BY_ID, RETAILERS, decodeUrl, FALABELLA_PRIMERA_PARTE } from './schema-v2.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
@@ -94,10 +94,14 @@ const SELECCION = `
       AND p.cur_online IS NOT NULL
       AND p.cur_online >= ${PISO_CENTIMOS}
       AND p.cur_online < s.ref * (1 - ${CAIDA_MIN})
-      -- Sólo precios que fija la propia tienda. Los VTEX no tienen vendedor (seller NULL);
-      -- en Falabella, todo lo que no sea primera parte es un seller que pone su precio por su
-      -- cuenta — y de ahí salen dos de los tres patrones de descuento fantasma de 04 §8.
-      AND (p.seller IS NULL
+      -- Sólo precios que fija la propia tienda. En Falabella se EXIGE primera parte; no vale
+      -- con "seller IS NULL", porque 385k productos suyos llevan corridas sin volver a verse y
+      -- también tienen el vendedor a nulo: colarían como si fueran de Falabella. Los retailers
+      -- VTEX no tienen el concepto de vendedor y pasan sin más.
+      -- De aquí salen dos de los tres patrones de descuento fantasma de 04 §8 (lista inflada de
+      -- marketplace y ancla fija de seller); el tercero, el placeholder de S/9,899, es de
+      -- Promart y Oechsle, así que este filtro NO lo toca.
+      AND (p.retailer <> ${RETAILERS.falabella.id}
            OR p.seller = (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}'))
   ),
   centinelas AS (
