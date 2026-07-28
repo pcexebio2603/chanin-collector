@@ -49,6 +49,7 @@
 // ---------------------------------------------------------------------------------------------
 import { query, exec } from './d1-client.js';
 import { BY_ID, RETAILERS, decodeUrl, FALABELLA_PRIMERA_PARTE } from './schema-v2.js';
+import { revisar, registrar, resumen } from './guardian.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
@@ -265,12 +266,22 @@ for (let i = 0; i < fala.length; i += CONCURRENCIA) {
 }
 log(`[ofertas] Falabella: ${muertas} descartadas por llevar a una página muerta`);
 
+// El guardián revisa lo que ha sobrevivido y aparta lo que se contradice consigo mismo.
+const { limpias, motivos, canarios } = await revisar(vivas);
+if (motivos.size) {
+  await registrar(motivos, new Map(vivas.map((c) => [c.id, c])));
+  log(`[ofertas] ${motivos.size} apartadas por el guardián:`);
+  for (const [motivo, n] of resumen(motivos)) console.log(`             ${String(n).padStart(4)}  ${motivo}`);
+} else {
+  log('[ofertas] el guardián no apartó ninguna');
+}
+
 // Recalculado entero en cada corrida: la vida útil de una oferta es de 1-3 días (verificado en
 // el análisis del 2026-07-24), así que arrastrar las viejas mostraría precios que ya no existen.
 const ahora = Math.floor(Date.now() / 1000);
 await exec('DELETE FROM ofertas;');
-for (let i = 0; i < vivas.length; i += 25) {
-  const trozo = vivas.slice(i, i + 25);
+for (let i = 0; i < limpias.length; i += 25) {
+  const trozo = limpias.slice(i, i + 25);
   await exec(trozo.map((c) =>
     `INSERT INTO ofertas (product_fk, ref, precio, caida, calculado) ` +
     `VALUES (${c.id},${c.ref},${c.cur_online},${c.caida},${ahora})`
@@ -294,4 +305,12 @@ if (VER) {
   for (const o of top) {
     console.log(`  ${String(o.pct).padStart(3)}%  ${o.antes} → ${o.ahora}  ${o.tienda.padEnd(10)} ${o.producto}`);
   }
+}
+
+// Un canario que reaparece significa que un cambio en el detector revivió un fallo ya corregido.
+// Se falla la corrida A PROPÓSITO —las ofertas limpias ya están publicadas— para que GitHub avise.
+if (canarios.length) {
+  console.error('\n*** REGRESIÓN: han reaparecido casos que ya estaban corregidos ***');
+  for (const c of canarios) console.error(`    · ${c.que}`);
+  process.exit(1);
 }
