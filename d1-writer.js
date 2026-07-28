@@ -10,6 +10,7 @@
 import { query, exec } from './d1-client.js';
 import {
   RETAILERS, BY_ID, encodeUrl, encodeImage, encodeCard, aCentimos, precioSano, PRECIO_MAX_CENTIMOS,
+  FALABELLA_PRIMERA_PARTE,
 } from './schema-v2.js';
 
 const q = (v) => (v == null ? 'NULL' : "'" + String(v).replace(/'/g, "''") + "'");
@@ -24,7 +25,7 @@ export async function makeD1Writer() {
   let lastId = 0;
   for (;;) {
     const rows = await query(
-      `SELECT id, retailer, sku, cur_online, cur_list, cur_stock, cur_card
+      `SELECT id, retailer, sku, cur_online, cur_list, cur_stock, cur_card, seller
        FROM products WHERE id > ? ORDER BY id LIMIT ${PAGE}`,
       [lastId]
     );
@@ -36,18 +37,39 @@ export async function makeD1Writer() {
   // 2. Diccionarios de marcas y categorías (nombre → id).
   const brands = new Map();
   const cats = new Map();
+  const sellers = new Map(); // sellerId de la tienda → id interno
   for (const b of await query('SELECT id, name FROM brands')) brands.set(b.name, b.id);
   for (const c of await query('SELECT id, name FROM categories')) cats.set(c.name, c.id);
+  for (const s of await query('SELECT id, name FROM sellers')) sellers.set(s.name, s.id);
 
   let pendientes = [];
+  const marcas = new Map(); // retailer|sku → sellerId de la tienda, para productos a re-etiquetar
   const runs = [];
   let escritos = 0;
   let descartados = 0;
+  let ajenos = 0;
+  let marcados = 0;
 
   // Igual firma que el writer local: síncrono, solo acumula, devuelve 1/0.
   function saveRow(row) {
     const key = row.retailer + '|' + row.sku;
     const prev = current.get(key);
+
+    // Vendedor (hoy sólo lo trae Falabella). Se anota cuando cambia o falta, aunque el producto
+    // no se vaya a rastrear: sin esa marca no se puede distinguir "es de un tercero" de "está
+    // descatalogado", y sin distinguirlo no se puede medir ni purgar el marketplace.
+    if (row.seller_ext) {
+      const idGuardado = prev?.seller ?? null;
+      if (idGuardado == null || sellers.get(row.seller_ext) !== idGuardado) {
+        marcas.set(key, { ext: row.seller_ext, label: row.seller_label ?? null, retailer: row.retailer });
+      }
+      // Sólo rastreamos lo que vende la propia tienda. Un seller del marketplace fija su precio
+      // por su cuenta: no es "el precio de Falabella", y es de donde salen las anclas infladas.
+      if (row.seller_ext !== FALABELLA_PRIMERA_PARTE) {
+        ajenos++;
+        return 0;
+      }
+    }
     const online = aCentimos(row.price_online);
     const list = aCentimos(row.price_list);
     const card = encodeCard(row.card_teaser);
@@ -68,7 +90,7 @@ export async function makeD1Writer() {
     const ts = Math.floor(Date.now() / 1000);
     pendientes.push({ row, ts, esNuevo: !prev, online, list, card, stock });
     current.set(key, {
-      id: prev?.id ?? null,
+      id: prev?.id ?? null, seller: prev?.seller ?? null,
       cur_online: online, cur_list: list, cur_stock: stock, cur_card: card,
     });
     return 1;
@@ -90,6 +112,43 @@ export async function makeD1Writer() {
     }
   }
 
+  // Da de alta vendedores nuevos y refresca el mapa con sus ids.
+  async function asegurarSellers(vals) {
+    const nuevos = [...new Map(
+      vals.filter((v) => v.ext && !sellers.has(v.ext)).map((v) => [v.ext, v])
+    ).values()];
+    if (!nuevos.length) return;
+    await execChunks(nuevos.map((v) =>
+      `INSERT OR IGNORE INTO sellers (name, label) VALUES (${q(v.ext)},${q(v.label)})`));
+    for (let i = 0; i < nuevos.length; i += 200) {
+      const trozo = nuevos.slice(i, i + 200);
+      const filas = await query(
+        `SELECT id, name FROM sellers WHERE name IN (${trozo.map((v) => q(v.ext)).join(',')})`);
+      for (const f of filas) sellers.set(f.name, f.id);
+    }
+  }
+
+  // Etiqueta productos con su vendedor. La primera corrida tras introducir esto marca todo el
+  // catálogo de Falabella (~128k); a partir de ahí sólo se escribe lo que cambia, así que el
+  // coste se desvanece solo.
+  async function escribirMarcas() {
+    if (!marcas.size) return;
+    const lote = [...marcas.entries()];
+    marcas.clear();
+    await asegurarSellers(lote.map(([, v]) => v));
+    await execChunks(lote.map(([key, v]) => {
+      const corte = key.indexOf('|');
+      const r = RETAILERS[key.slice(0, corte)];
+      return `UPDATE products SET seller=${num(sellers.get(v.ext) ?? null)} ` +
+             `WHERE retailer=${r.id} AND sku=${q(key.slice(corte + 1))}`;
+    }));
+    for (const [key, v] of lote) {
+      const prev = current.get(key);
+      if (prev) prev.seller = sellers.get(v.ext) ?? null;
+    }
+    marcados += lote.length;
+  }
+
   async function escribir(lote) {
     if (!lote.length) return;
 
@@ -106,11 +165,11 @@ export async function makeD1Writer() {
         const { img_var, img } = encodeImage(r, row.sku, row.image);
         return (
           `INSERT OR IGNORE INTO products ` +
-          `(retailer,product_id,sku,name,brand,category,slug,img_var,img,first_seen,last_checked,cur_online,cur_list,cur_stock,cur_card) ` +
+          `(retailer,product_id,sku,name,brand,category,slug,img_var,img,first_seen,last_checked,cur_online,cur_list,cur_stock,cur_card,seller) ` +
           `VALUES (${r.id},${q(row.product_id)},${q(row.sku)},${q(row.name)},` +
           `${num(brands.get(row.brand) ?? null)},${num(cats.get(row.category) ?? null)},` +
           `${q(slug)},${img_var},${q(img)},${ts},${ts},` +
-          `${num(online)},${num(list)},${stock},${num(card)})`
+          `${num(online)},${num(list)},${stock},${num(card)},${num(sellers.get(row.seller_ext) ?? null)})`
         );
       }));
     }
@@ -143,6 +202,7 @@ export async function makeD1Writer() {
 
   // Vuelca solo si ya se acumuló bastante. El colector la llama al cerrar cada categoría.
   async function maybeFlush() {
+    await escribirMarcas();
     if (pendientes.length < UMBRAL) return;
     const lote = pendientes;
     pendientes = [];
@@ -151,6 +211,7 @@ export async function makeD1Writer() {
 
   // Vuelca todo lo que quede, más la bitácora de corridas.
   async function flush() {
+    await escribirMarcas();
     while (pendientes.length) {
       await escribir(pendientes.splice(0, UMBRAL));
     }
@@ -161,6 +222,9 @@ export async function makeD1Writer() {
         `${num(r.products)},${num(r.changes)},${num(r.errors)},${num(r.duration_ms)},${q(r.status)})`
       ));
       runs.length = 0;
+    }
+    if (ajenos || marcados) {
+      console.log(`${new Date().toISOString()} [d1] ${ajenos} items de terceros ignorados (marketplace), ${marcados} productos etiquetados con su vendedor`);
     }
     if (descartados) {
       console.log(`${new Date().toISOString()} [d1] ${descartados} puntos descartados por precio imposible (>S/${(PRECIO_MAX_CENTIMOS / 100).toLocaleString('es-PE')})`);

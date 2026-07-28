@@ -206,6 +206,12 @@ function normalize(p, categoryName) {
     // Sin señal fiable de stock en el listing; los items listados son comprables.
     // in_stock = 1 cuando hay precio online válido.
     in_stock: 1,
+    // Vendedor. El listing distingue primera parte (FALABELLA_PERU) del marketplace, e incluso
+    // Tottus y Sodimac tienen id propio pese a ser del mismo grupo. Sólo rastreamos lo que
+    // vende Falabella: el criterio es "el precio que la tienda controla", y el de un seller
+    // ajeno no lo es. El filtro se aplica en d1-writer.js.
+    seller_ext: p.sellerId ?? null,
+    seller_label: p.sellerName ?? null,
   };
 }
 

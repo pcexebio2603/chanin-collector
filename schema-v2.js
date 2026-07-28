@@ -96,6 +96,13 @@ export const deCentimos = (c) => (c == null ? null : c / 100);
 // tienda muestra es la premisa del producto.
 export const PRECIO_MAX_CENTIMOS = 100_000_000; // S/1,000,000
 
+// Vendedor de primera parte en Falabella. Todo lo demás es marketplace y NO se rastrea: el
+// criterio es "el precio que la tienda controla". Tottus (TOTTUS_PERU) y Sodimac (SODIMAC_PERU)
+// tienen id propio y quedan fuera pese a ser del mismo grupo — su precio es tan ajeno como el
+// de cualquier seller. Medido el 2026-07-28 sobre 6 categorías: 45% de los items listados por
+// Falabella son de terceros, repartidos en 78 vendedores distintos.
+export const FALABELLA_PRIMERA_PARTE = 'FALABELLA_PERU';
+
 export const precioSano = (centimos) =>
   centimos != null && Number.isFinite(centimos) && centimos > 0 && centimos <= PRECIO_MAX_CENTIMOS;
 
