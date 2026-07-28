@@ -86,14 +86,29 @@ const SELECCION = `
     WHERE total > 0 AND hasta_aqui >= total / 2.0
     GROUP BY product_fk
   ),
+  -- La referencia final es la MENOR entre la que medimos y el precio normal que declara la
+  -- propia tienda. Nunca se sube para igualar un "antes" inflado; sólo se baja cuando la tienda
+  -- admite que su precio habitual es menor que lo que nosotros vimos.
+  --
+  -- Lo destapó Pablo con un procesador AMD Ryzen 5 3600 (2026-07-28): lo anunciábamos "de
+  -- S/1,012 a S/508", y era cierto que costó 1,012 durante 13 de los 15 días que llevábamos
+  -- midiendo. Pero la tienda declaraba un precio de lista de S/564: el 1,012 era un precio
+  -- viejo que dejaron de sostener, no la referencia del producto. El descuento real era del
+  -- 10%, no del 50%. Ninguna tienda declara un "antes" MÁS BARATO de lo que cobró de verdad,
+  -- así que cuando su lista queda por debajo de nuestra medición, manda la suya.
+  --
+  -- Afectaba a 247 de 484 ofertas: su caída media pasa del 36% al 21%.
   cand AS (
-    SELECT p.id, s.ref, p.cur_online, (1 - p.cur_online * 1.0 / s.ref) AS caida
+    SELECT p.id,
+           MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) AS ref,
+           p.cur_online,
+           (1 - p.cur_online * 1.0 / MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref))) AS caida
     FROM products p
     JOIN sostenidos s ON s.product_fk = p.id
     WHERE p.cur_stock = 1                    -- sin stock no es oferta: nadie puede comprarla
       AND p.cur_online IS NOT NULL
       AND p.cur_online >= ${PISO_CENTIMOS}
-      AND p.cur_online < s.ref * (1 - ${CAIDA_MIN})
+      AND p.cur_online < MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) * (1 - ${CAIDA_MIN})
       -- Sólo precios que fija la propia tienda. En Falabella se EXIGE primera parte; no vale
       -- con "seller IS NULL", porque 385k productos suyos llevan corridas sin volver a verse y
       -- también tienen el vendedor a nulo: colarían como si fueran de Falabella. Los retailers
