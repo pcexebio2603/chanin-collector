@@ -222,30 +222,67 @@ async function verificarVtex(lista) {
 // `last_checked` NO sirve para detectarlo: sólo se actualiza cuando el precio CAMBIA, así que
 // hoy apenas 19k de 794k productos lo tienen fresco (comprobado el 2026-07-28).
 //
-// Por eso se comprueban las urls por HTTP, pero SÓLO las candidatas (~1k), no el catálogo
-// entero: es la diferencia entre un minuto y un día de peticiones. Rate limit respetuoso y
-// concurrencia baja, en la línea del resto del colector.
+// Por eso se comprueban las urls por HTTP, pero SÓLO las candidatas, no el catálogo entero: es
+// la diferencia entre un minuto y un día de peticiones. Rate limit respetuoso y concurrencia
+// baja, en la línea del resto del colector.
 // ---------------------------------------------------------------------------------------------
 const MUERTA = /\/Sistema\/404|ProductLinkNotFound|pagina-no-encontrada|not-?found/i;
 const CONCURRENCIA = 5;
 
-async function viva(url) {
+// Falabella no tiene endpoint por SKU, pero su ficha es Next.js y lleva un `__NEXT_DATA__` con
+// todo lo que hace falta. Como la página ya se descargaba para comprobar el 404, leerla en vez
+// de tirarla no cuesta NI UNA petición más.
+//
+// Señales verificadas contra un producto disponible y otro agotado (2026-07-28):
+//        isOutOfStock  isPurchaseable  isOnlineSellable
+//   ok        false         true            true
+//   agotado   true          false           false
+// Se usa `isPurchaseable` de la VARIANTE porque va por SKU: un producto puede tener una talla
+// agotada y otras disponibles.
+//
+// Si el marcado cambia y no se puede parsear, se vuelve al comportamiento anterior (sólo mirar
+// que no sea un 404) y se registra. Un cambio de maquetación no puede vaciar el carrusel.
+let falaSinParsear = 0;
+
+function precioDeVariante(v) {
+  const por = {};
+  for (const p of v?.prices ?? []) {
+    const n = Number(String(Array.isArray(p.price) ? p.price[0] : p.price).replace(/[^0-9.]/g, ''));
+    if (p.type && Number.isFinite(n)) por[p.type] = n;
+  }
+  const online = [por.internetPrice, por.eventPrice].filter((x) => x != null);
+  return online.length ? Math.min(...online) : null;
+}
+
+async function viva(url, sku, precioEsperado) {
   try {
     const res = await fetch(url, {
       redirect: 'follow',
       headers: { 'User-Agent': UA },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(20000),
     });
     if (res.status >= 400) return false;
-    return !MUERTA.test(res.url); // la tienda puede responder 200 tras redirigir a su página de 404
+    if (MUERTA.test(res.url)) return false; // 200 tras redirigir a su página de 404
+
+    const html = await res.text();
+    const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+    if (!m) { falaSinParsear++; return true; }
+    const pd = JSON.parse(m[1])?.props?.pageProps?.productData;
+    const v = pd?.variants?.find((x) => String(x.id) === String(sku)) ?? pd?.variants?.[0];
+    if (!v) { falaSinParsear++; return true; }
+
+    if (v.isPurchaseable === false || pd.isOutOfStock === true) return false;
+    const precio = precioDeVariante(v);
+    if (precio != null && Math.abs(Math.round(precio * 100) - precioEsperado) > 50) return false;
+    return true;
   } catch {
     return true; // ante un fallo de red no castigamos al producto: se revisa en la próxima corrida
   }
 }
 
-// VTEX se verifica contra su API de catálogo (precio y stock reales, y de paso descarta lo
-// descatalogado). Falabella no tiene endpoint por SKU, así que se queda con la comprobación de
-// url — pilla los 404 pero no un "agotado", que es una limitación conocida y anotada.
+// Cada tienda se verifica con lo que expone: VTEX por su API de catálogo, Falabella leyendo el
+// __NEXT_DATA__ de la ficha que ya se descargaba. Las cuatro quedan con el mismo criterio —
+// fuera si está agotado o si el precio ya no coincide.
 const okVtex = await verificarVtex(cands);
 const esFala = (c) => BY_ID[c.retailer].name === 'falabella';
 const vtex = cands.filter((c) => !esFala(c));
@@ -259,12 +296,13 @@ for (let i = 0; i < fala.length; i += CONCURRENCIA) {
   const trozo = fala.slice(i, i + CONCURRENCIA);
   const res = await Promise.all(trozo.map((c) => {
     const r = BY_ID[c.retailer];
-    return viva(decodeUrl(r, c.product_id, c.slug));
+    return viva(decodeUrl(r, c.product_id, c.slug), c.sku, c.cur_online);
   }));
   res.forEach((ok, j) => (ok ? vivas.push(trozo[j]) : muertas++));
   await new Promise((r) => setTimeout(r, 250));
 }
-log(`[ofertas] Falabella: ${muertas} descartadas por llevar a una página muerta`);
+log(`[ofertas] Falabella: ${fala.length - muertas} de ${fala.length} siguen comprables y al mismo precio` +
+    (falaSinParsear ? ` (${falaSinParsear} sin poder parsear la ficha, aceptadas por defecto)` : ''));
 
 // El guardián revisa lo que ha sobrevivido y aparta lo que se contradice consigo mismo.
 const { limpias, motivos, canarios } = await revisar(vivas);
