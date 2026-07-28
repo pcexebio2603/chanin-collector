@@ -135,15 +135,31 @@ await exec(`
     ref        INTEGER NOT NULL,
     precio     INTEGER NOT NULL,
     caida      REAL NOT NULL,
-    calculado  INTEGER NOT NULL
+    calculado  INTEGER NOT NULL,
+    bajo       INTEGER          -- cuándo se produjo la última BAJADA de precio
   );
   CREATE INDEX IF NOT EXISTS idx_ofertas_caida ON ofertas(caida DESC);
 `);
 
 // Candidatas, con lo justo para reconstruir su url y poder comprobarla.
+// `bajo` = cuándo se produjo la última bajada REAL de precio. No vale con el último cambio a
+// secas: un producto que subió un poco pero sigue por debajo de su referencia diría "bajó hace
+// X" siendo falso. Se compara cada punto con el anterior y se busca el último descenso.
 const cands = await query(`
-  SELECT c.id, c.ref, c.cur_online, c.caida, p.retailer, p.sku, p.product_id, p.slug
-  FROM (${SELECCION}) c JOIN products p ON p.id = c.id
+  WITH cand AS (${SELECCION}),
+  trans AS (
+    SELECT product_fk, ts, price_online,
+           LAG(price_online) OVER (PARTITION BY product_fk ORDER BY ts) AS ant
+    FROM price_points
+  ),
+  bajada AS (
+    SELECT product_fk, MAX(ts) AS bajo FROM trans
+    WHERE ant IS NOT NULL AND price_online < ant GROUP BY product_fk
+  )
+  SELECT c.id, c.ref, c.cur_online, c.caida, p.retailer, p.sku, p.product_id, p.slug, b.bajo
+  FROM cand c
+  JOIN products p       ON p.id = c.id
+  LEFT JOIN bajada b    ON b.product_fk = c.id
 `);
 log(`[ofertas] ${cands.length} candidatas tras el filtro de credibilidad`);
 
@@ -321,8 +337,8 @@ await exec('DELETE FROM ofertas;');
 for (let i = 0; i < limpias.length; i += 25) {
   const trozo = limpias.slice(i, i + 25);
   await exec(trozo.map((c) =>
-    `INSERT INTO ofertas (product_fk, ref, precio, caida, calculado) ` +
-    `VALUES (${c.id},${c.ref},${c.cur_online},${c.caida},${ahora})`
+    `INSERT INTO ofertas (product_fk, ref, precio, caida, calculado, bajo) ` +
+    `VALUES (${c.id},${c.ref},${c.cur_online},${c.caida},${ahora},${c.bajo ?? 'NULL'})`
   ).join(';\n') + ';');
 }
 
