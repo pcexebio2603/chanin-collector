@@ -62,7 +62,20 @@ const REVERIFICAR = process.argv.includes('--reverificar');
 const DIAS_VENTANA = 90;      // historia que entra en la mediana; hoy sobra, en octubre no
 const CAIDA_MIN = 0.30;
 const CAIDA_MAX = 0.85;       // por encima domina el fantasma; ver cabecera
-const PISO_CENTIMOS = 10000;  // S/100: por debajo el ruido se come la señal
+// Ahorro mínimo para ocupar un hueco del carrusel. Sustituye al antiguo piso de precio de
+// S/100 el 2026-07-28, después de medirlo: el piso se justificaba diciendo que "por debajo el
+// ruido se come la señal", y eso resultó ser FALSO. Por bandas de precio, la caída media (35-39%),
+// la profundidad del historial y la solidez de la referencia (66-70% del tiempo, cero referencias
+// débiles) salen iguales arriba y abajo. Las ofertas baratas están igual de bien fundadas.
+//
+// Lo único que cambiaba de verdad era el ahorro absoluto: S/387 de media por encima de S/100,
+// S/13 por debajo de S/30. O sea que el filtro que queríamos era sobre el AHORRO, no sobre el
+// precio. Y el piso no protegía de nada: ni una sola oferta de las que pasaban ahorraba menos de
+// S/25, mientras bloqueaba 267 que sí lo superaban. Era un filtro con sólo falsos negativos.
+//
+// Lo que entra con este cambio es en un 92% moda de Falabella — justo donde su catálogo propio
+// es fuerte, al contrario que en tecnología (90% marketplace).
+const AHORRO_MINIMO = 2500;   // S/25
 const CENTINELA_PRODUCTOS = 3;    // un valor de referencia compartido por al menos tantos productos…
 const CENTINELA_CAIDA = 0.88;     // …y con caída media de este orden, es un placeholder de catálogo
 
@@ -112,7 +125,7 @@ const SELECCION = `
     JOIN sostenidos s ON s.product_fk = p.id
     WHERE p.cur_stock = 1                    -- sin stock no es oferta: nadie puede comprarla
       AND p.cur_online IS NOT NULL
-      AND p.cur_online >= ${PISO_CENTIMOS}
+      AND MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) - p.cur_online >= ${AHORRO_MINIMO}
       AND p.cur_online < MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) * (1 - ${CAIDA_MIN})
       -- Sólo precios que fija la propia tienda. En Falabella, un vendedor nulo NO significa
       -- "es de Falabella": son 385k productos que llevan corridas sin volver a verse (los topes

@@ -17,7 +17,7 @@ const arg = (f) => { const i = process.argv.indexOf(f); return i >= 0 ? process.
 const URL_ = arg('--url'); const SKU = arg('--sku'); const NOMBRE = arg('--nombre'); const TIENDA = arg('--tienda');
 
 // Mismos parámetros que ofertas.js. Si allí cambian, aquí también.
-const DIAS_VENTANA = 90, CAIDA_MIN = 0.30, CAIDA_MAX = 0.85, PISO_CENTIMOS = 10000;
+const DIAS_VENTANA = 90, CAIDA_MIN = 0.30, CAIDA_MAX = 0.85, AHORRO_MINIMO = 2500;
 
 const soles = (c) => (c == null ? '—' : 'S/ ' + (c / 100).toFixed(2));
 const ok = (m) => console.log(`   \x1b[32m✓\x1b[0m ${m}`);
@@ -117,20 +117,21 @@ for (const f of filas) {
     ok(r.name === 'falabella' ? 'Lo vende Falabella (primera parte).' : 'Retailer sin marketplace.');
   }
 
-  // 3. piso de precio
-  if (f.cur_online < PISO_CENTIMOS) {
-    no(`${soles(f.cur_online)} está por debajo del piso de ${soles(PISO_CENTIMOS)}.`);
-    nota('Por debajo de ese precio el ruido se come la señal, así que ni se evalúa.');
-    continue;
-  }
-  ok(`Supera el piso de ${soles(PISO_CENTIMOS)}.`);
-
-  // 4. referencia
+  // 3. referencia
   const medida = refs.get(f.id);
   if (medida == null) { no('Sin historial suficiente para calcular una referencia.'); continue; }
   const ref = Math.min(medida, f.cur_list || medida);
   const topada = f.cur_list && f.cur_list < medida;
   ok(`Referencia ${soles(ref)}` + (topada ? ` (medimos ${soles(medida)}, pero la tienda declara ${soles(f.cur_list)} y manda la suya)` : ''));
+
+  // 4. ahorro mínimo (sustituyó al piso de precio el 2026-07-28; el porqué, en ofertas.js)
+  const ahorro = ref - f.cur_online;
+  if (ahorro < AHORRO_MINIMO) {
+    no(`Sólo ahorra ${soles(ahorro)} y el mínimo son ${soles(AHORRO_MINIMO)}.`);
+    nota('El carrusel tiene sitio limitado: un ahorro pequeño no justifica una tarjeta.');
+    continue;
+  }
+  ok(`Ahorra ${soles(ahorro)}.`);
 
   // 5. banda de caída
   const caida = 1 - f.cur_online / ref;
