@@ -148,14 +148,16 @@ const SELECCION = `
 if (RECHAZADAS) {
   const filas = await query(`
     WITH ${sqlReferencia()},
-    base AS (
+    -- 'base' es un nombre que ya usa referencia.js: aquí sería una CTE duplicada y SQLite lo
+    -- rechaza. Se llama evaluables.
+    evaluables AS (
       SELECT p.id, p.name, p.cur_online, p.cur_stock, p.retailer, p.seller,
              MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) AS ref
       FROM products p JOIN sostenidos s ON s.product_fk = p.id
       WHERE p.cur_online IS NOT NULL
     ),
     con_caida AS (
-      SELECT *, (1 - cur_online * 1.0 / ref) AS caida FROM base WHERE ref > 0
+      SELECT *, (1 - cur_online * 1.0 / ref) AS caida FROM evaluables WHERE ref > 0
     ),
     -- Los centinelas se calculan sobre EXACTAMENTE la misma población que en la selección (cand):
     -- con stock, con ahorro y caída suficientes Y de primera parte. Sin el filtro de vendedor la

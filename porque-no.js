@@ -74,10 +74,11 @@ if (!filas.length) {
 const ids = filas.map((f) => f.id).join(',');
 const refs = new Map((await query(`
   WITH ${sqlReferencia({ filtro: `AND product_fk IN (${ids})` })}
-  SELECT mp.product_fk, mp.ref AS minimo_previo, md.ref AS mediana, s.ref
+  SELECT b.product_fk, b.ref AS base, md.ref AS mediana, s.ref, v.subidas
   FROM sostenidos s
-  JOIN minimo_previo mp ON mp.product_fk = s.product_fk
-  JOIN mediana md       ON md.product_fk = s.product_fk
+  JOIN base b     ON b.product_fk = s.product_fk
+  JOIN mediana md ON md.product_fk = s.product_fk
+  JOIN variacion v ON v.product_fk = s.product_fk
 `)).map((r) => [r.product_fk, r]));
 const publicadas = new Set((await query(`SELECT product_fk FROM ofertas WHERE product_fk IN (${ids})`)).map((r) => r.product_fk));
 const encuarentena = new Map((await query(`SELECT product_fk, motivo FROM cuarentena WHERE product_fk IN (${ids})`)).map((r) => [r.product_fk, r.motivo]));
@@ -119,12 +120,14 @@ for (const f of filas) {
   const medida = m.ref;
   const ref = Math.min(medida, f.cur_list || medida);
   const topada = f.cur_list && f.cur_list < medida;
-  const manda = m.minimo_previo < m.mediana ? 'el mínimo previo'
-              : m.mediana < m.minimo_previo ? 'la mediana ponderada'
+  const comoSeMide = m.subidas === 0 ? 'nunca subió de precio, así que se toma donde empezó la bajada'
+                                     : 'el precio más bajo al que estuvo antes de la bajada actual';
+  const manda = m.base < m.mediana ? 'esa medida'
+              : m.mediana < m.base ? 'la mediana ponderada (la rebaja ya lleva más de la mitad del tiempo)'
               : 'las dos por igual';
-  ok(`Referencia ${soles(ref)} — manda ${manda}` +
-     ` (mínimo previo ${soles(m.minimo_previo)} · mediana ${soles(m.mediana)})` +
-     (topada ? `; la tienda declara ${soles(f.cur_list)} y manda la suya` : ''));
+  ok(`Referencia ${soles(ref)} — manda ${manda}`);
+  nota(`${soles(m.base)}: ${comoSeMide} · mediana ponderada ${soles(m.mediana)}` +
+       (topada ? ` · la tienda declara ${soles(f.cur_list)} y manda la suya` : ''));
 
   // 4. ahorro mínimo (sustituyó al piso de precio el 2026-07-28; el porqué, en ofertas.js)
   const ahorro = ref - f.cur_online;

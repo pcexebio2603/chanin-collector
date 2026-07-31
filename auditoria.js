@@ -169,6 +169,48 @@ console.log('\n— ¿cuánto tiempo estuvo vigente esa referencia? —');
 await aguante(nueva.lista, 'mín. previo + mediana (hoy)');
 await aguante(vieja.lista, 'mediana sola (hasta 31-jul)');
 
+
+// ---------------------------------------------------------------------------------------------
+// TERCERA MÉTRICA: ¿DICEN LO MISMO EL CARRUSEL Y EL POP-UP?
+//
+// Son dos nociones distintas de "precio de referencia" y pueden contradecirse: el carrusel usa la
+// menor del mínimo previo y la mediana; el veredicto de la ficha usa el mínimo y el promedio de
+// los últimos 90 días (makeVerdict en api/aggregates.js). El 2026-07-31 Pablo abrió un parlante
+// anunciado al -72% cuya ficha decía "Precio normal" — y tenía razón la ficha.
+//
+// Ese día, tras cambiar la referencia, se midió que las 164 ofertas publicadas mostraban
+// "Cerca de su mínimo histórico": la contradicción desapareció sola, porque exigir que el precio
+// esté por debajo de todo lo anterior lo deja por fuerza cerca del mínimo. Esto lo vigila para
+// que no vuelva sin que nadie se entere.
+//
+// La condición está copiada de makeVerdict (precio <= mínimo de 90 días * 1.02) porque vive en
+// otro repo y no se puede importar. Si allí cambia, aquí hay que tocarlo: es la única copia que
+// queda y por eso está dicho aquí.
+const coherencia = await query(`
+  WITH m AS (
+    SELECT product_fk, MIN(price_online) AS minimo
+    FROM price_points
+    WHERE ts >= strftime('%s','now') - 90 * 86400
+    GROUP BY product_fk
+  )
+  SELECT p.name, o.ref, o.precio, m.minimo
+  FROM ofertas o
+  JOIN m ON m.product_fk = o.product_fk
+  JOIN products p ON p.id = o.product_fk
+  WHERE o.precio > m.minimo * 1.02
+`);
+const publicadas = await query('SELECT COUNT(*) n FROM ofertas');
+console.log('\n— ¿el pop-up contradice al carrusel? —');
+if (!coherencia.length) {
+  console.log(`  ninguna de las ${publicadas[0].n} publicadas: todas saldrían como "cerca de su mínimo histórico"`);
+} else {
+  console.log(`  ${coherencia.length} de ${publicadas[0].n} publicadas NO saldrían como "cerca de su mínimo" en su ficha:`);
+  for (const c of coherencia.slice(0, 10)) {
+    console.log(`     S/${(c.ref / 100).toFixed(2)} → S/${(c.precio / 100).toFixed(2)}` +
+                ` pero su mínimo de 90 días es S/${(c.minimo / 100).toFixed(2)}  ${String(c.name).slice(0, 46)}`);
+  }
+}
+
 console.log('');
 log(`[auditoría] la primera métrica no discrimina con ${DIAS} días de ventana posterior: la mayoría`);
 log(`[auditoría] de productos no cambia de precio en ese plazo. La segunda sí, y no necesita esperar.`);

@@ -43,7 +43,7 @@ export const DIAS_VENTANA = 90; // historia que entra; hoy sobra, en octubre no
 
 /**
  * Devuelve las CTE que calculan la referencia, para pegar detrás de un `WITH`.
- * Expone `sostenidos(product_fk, ref)` —la referencia final— y deja a la vista `minimo_previo`
+ * Expone `sostenidos(product_fk, ref)` —la referencia final— y deja a la vista `base`
  * y `mediana` por separado, que es lo que necesita el diagnóstico para decir cuál de las dos
  * manda en cada producto. `pts` queda disponible con ts, precio, stock y duración.
  *
@@ -78,6 +78,34 @@ export function sqlReferencia({ ahora = "strftime('%s','now')", dias = DIAS_VENT
     WHERE p.ts < i.desde
     GROUP BY p.product_fk
   ),
+  -- (1b) LA EXCEPCIÓN DE LA ESCALERA. El mínimo previo castiga la rebaja progresiva: en
+  -- 199 → 149 → 129 toma como "antes" el escalón anterior (149) y no donde empezó la bajada
+  -- (199), así que un descuento real del 35% se queda en un 13% y no se publica. Le pasaba a las
+  -- cámaras Tenda y a la blusa Almat, cuyo precio de lista declarado por la tienda confirma la
+  -- referencia alta (S/259 y S/139).
+  --
+  -- Cuando el producto NUNCA subió de precio en la ventana, la referencia es el precio con el que
+  -- empezó — que en una serie no creciente es su máximo. El máximo se abandonó el 28-jul por
+  -- frágil ante un pico, pero aquí no puede haberlo: un pico ES una subida, y basta una para que
+  -- esta rama se desactive y vuelva a mandar el mínimo previo. Quien manipula tiene que subir el
+  -- precio, así que no puede alcanzar este caso.
+  --
+  -- Medido el 31-jul: 1,148 productos con escalera estrictamente descendente, de los que se
+  -- recuperan 3 ofertas. Poco hoy, pero es un sesgo sistemático contra las rebajas progresivas,
+  -- que son la norma en moda.
+  variacion AS (
+    SELECT product_fk,
+           SUM(CASE WHEN ant IS NOT NULL AND price_online > ant THEN 1 ELSE 0 END) AS subidas,
+           MAX(price_online) AS maximo
+    FROM pts
+    GROUP BY product_fk
+  ),
+  base AS (
+    SELECT mp.product_fk,
+           CASE WHEN v.subidas = 0 THEN v.maximo ELSE mp.ref END AS ref
+    FROM minimo_previo mp
+    JOIN variacion v ON v.product_fk = mp.product_fk
+  ),
   acum AS (
     SELECT product_fk, price_online,
            SUM(dur) OVER (PARTITION BY product_fk ORDER BY price_online
@@ -92,7 +120,7 @@ export function sqlReferencia({ ahora = "strftime('%s','now')", dias = DIAS_VENT
     GROUP BY product_fk
   ),
   sostenidos AS (
-    SELECT mp.product_fk, MIN(mp.ref, md.ref) AS ref
-    FROM minimo_previo mp JOIN mediana md ON md.product_fk = mp.product_fk
+    SELECT b.product_fk, MIN(b.ref, md.ref) AS ref
+    FROM base b JOIN mediana md ON md.product_fk = b.product_fk
   )`;
 }
