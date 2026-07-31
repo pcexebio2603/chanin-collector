@@ -108,10 +108,15 @@ const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 // —mediana, percentiles, "precio sostenido"— porque todas miden PROPORCIÓN DE TIEMPO, y quien
 // manipula controla justamente cuánto dura la subida.
 //
-// La referencia es ahora el PRECIO MÁS BAJO AL QUE ESTUVO EL PRODUCTO ANTES DEL RÉGIMEN DE
-// PRECIO ACTUAL. Un mínimo es inmune por construcción: alargar un pico no baja ningún mínimo,
-// así que la duración deja de ser una palanca. Y no tiene ningún parámetro que calibrar, que es
-// la otra mitad del problema: los umbrales de "sostenido" se eligen a ojo y se pueden esquivar.
+// La referencia es ahora la MENOR de dos: el precio más bajo al que estuvo el producto antes del
+// régimen de precio actual, y la mediana ponderada de siempre. El mínimo previo es inmune por
+// construcción —alargar un pico no baja ningún mínimo, así que la duración deja de ser palanca— y
+// no tiene ningún parámetro que calibrar. La mediana se queda porque aporta lo único que al
+// mínimo le falta: EXPIRAR. Medido el 31-jul, el mínimo previo a solas daba 1,015 candidatas
+// contra 413 de la mediana, y el 64% de ellas habían bajado hacía 8 días o más: sin la mediana,
+// una bajada vieja se sigue anunciando hasta que su régimen anterior sale de la ventana de 90
+// días. Con las dos, 312 candidatas — la intersección exacta, más estricta que cualquiera de
+// ellas por separado, que es lo que pide elegir precisión.
 //
 // MEDIDO sobre la foto de las 235 ofertas publicadas el 31-jul (backtest en el commit):
 //     70 ofertas FALSAS (el precio de hoy no mejora el de antes del pico) → 0 sobreviven
@@ -132,22 +137,49 @@ const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 const REFERENCIA = `
   pts AS (
     SELECT product_fk, ts, price_online,
-           LAG(price_online) OVER (PARTITION BY product_fk ORDER BY ts) AS ant
+           LAG(price_online) OVER (PARTITION BY product_fk ORDER BY ts) AS ant,
+           COALESCE(LEAD(ts) OVER (PARTITION BY product_fk ORDER BY ts), strftime('%s','now')) - ts AS dur
     FROM price_points
     WHERE ts >= strftime('%s','now') - ${DIAS_VENTANA} * 86400
   ),
-  -- Inicio del régimen de precio actual: la primera fila del último tramo de precio igual.
+  -- (1) MÍNIMO PREVIO. Inicio del régimen de precio actual = la primera fila del último tramo de
+  -- precio igual; el mínimo de todo lo anterior es la referencia. Inmune al pico: alargar una
+  -- subida no baja ningún mínimo.
   inicio AS (
     SELECT product_fk, MAX(ts) AS desde
     FROM pts
     WHERE ant IS NULL OR price_online <> ant
     GROUP BY product_fk
   ),
-  sostenidos AS (
+  minimo_previo AS (
     SELECT p.product_fk, MIN(p.price_online) AS ref
     FROM pts p JOIN inicio i ON i.product_fk = p.product_fk
     WHERE p.ts < i.desde
     GROUP BY p.product_fk
+  ),
+  -- (2) MEDIANA PONDERADA POR TIEMPO. Ya no sostiene la referencia por sí sola, pero se conserva
+  -- porque aporta algo que el mínimo previo no tiene: EXPIRA. Cuando el precio rebajado lleva más
+  -- de la mitad del tiempo, la mediana baja hasta él y el producto deja de anunciarse — que es lo
+  -- que este archivo decidió el 28-jul: a esas alturas ya no es una rebaja, es su precio nuevo.
+  acum AS (
+    SELECT product_fk, price_online,
+           SUM(dur) OVER (PARTITION BY product_fk ORDER BY price_online
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hasta_aqui,
+           SUM(dur) OVER (PARTITION BY product_fk) AS total
+    FROM pts
+  ),
+  mediana AS (
+    SELECT product_fk, MIN(price_online) AS ref
+    FROM acum
+    WHERE total > 0 AND hasta_aqui >= total / 2.0
+    GROUP BY product_fk
+  ),
+  -- Manda la MENOR de las dos, igual que con el precio de lista de la tienda: la referencia nunca
+  -- se sube para poder anunciar más, sólo se baja. El resultado es la intersección exacta de las
+  -- dos reglas, así que no puede publicar nada que cualquiera de ellas rechace.
+  sostenidos AS (
+    SELECT mp.product_fk, MIN(mp.ref, md.ref) AS ref
+    FROM minimo_previo mp JOIN mediana md ON md.product_fk = mp.product_fk
   )`;
 
 const SELECCION = `
