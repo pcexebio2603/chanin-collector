@@ -483,7 +483,13 @@ if (motivos.size) {
 
 // Recalculado entero en cada corrida: la vida útil de una oferta es de 1-3 días (verificado en
 // el análisis del 2026-07-24), así que arrastrar las viejas mostraría precios que ya no existen.
+//
+// Antes de borrar se apunta QUÉ había, para poder medir la rotación. La tabla `ofertas` no guarda
+// historia —se reescribe entera— así que sin esto la pregunta "¿el carrusel se está quedando
+// corto?, ¿entra y sale demasiado?" sólo se puede responder mirándolo a mano y acordándose de
+// hacerlo. Con dos números por corrida se responde sola en el informe semanal.
 const ahora = Math.floor(Date.now() / 1000);
+const antes = new Set((await query('SELECT product_fk FROM ofertas')).map((r) => r.product_fk));
 await exec('DELETE FROM ofertas;');
 for (let i = 0; i < limpias.length; i += 25) {
   const trozo = limpias.slice(i, i + 25);
@@ -497,6 +503,22 @@ const [{ n, prof }] = await query(
   `SELECT COUNT(*) n, SUM(caida >= 0.5) prof FROM ofertas`
 );
 log(`[ofertas] ${n} ofertas publicables (${prof ?? 0} con caída >=50%)`);
+
+// Rotación de esta corrida. Una fila por corrida, nada más: la serie completa de tres meses
+// ocupa menos que una sola oferta.
+const nuevas = limpias.filter((c) => !antes.has(c.id)).length;
+const salidas = [...antes].filter((id) => !limpias.some((c) => c.id === id)).length;
+await exec(`
+  CREATE TABLE IF NOT EXISTS ofertas_resumen (
+    calculado  INTEGER PRIMARY KEY,
+    publicadas INTEGER NOT NULL,
+    nuevas     INTEGER NOT NULL,
+    salidas    INTEGER NOT NULL
+  );
+  INSERT OR REPLACE INTO ofertas_resumen (calculado, publicadas, nuevas, salidas)
+  VALUES (${ahora}, ${limpias.length}, ${nuevas}, ${salidas});
+`);
+log(`[ofertas] rotación: ${nuevas} nuevas, ${salidas} salieron respecto de la corrida anterior`);
 
 if (VER) {
   const top = await query(`

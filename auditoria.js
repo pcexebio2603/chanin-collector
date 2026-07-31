@@ -23,7 +23,7 @@
 // liquidación larga y legítima puede no haber vuelto todavía y cuenta como "no volvió", así que
 // la tasa es un SUELO, no una medida exacta. Mejora sola conforme se acumule historial.
 import { query } from './d1-client.js';
-import { FALABELLA_PRIMERA_PARTE, RETAILERS } from './schema-v2.js';
+import { FALABELLA_PRIMERA_PARTE, RETAILERS, BY_ID } from './schema-v2.js';
 import { sqlReferencia } from './referencia.js';
 
 const argOf = (f) => { const i = process.argv.indexOf(f); return i >= 0 ? process.argv[i + 1] : undefined; };
@@ -171,45 +171,98 @@ await aguante(vieja.lista, 'mediana sola (hasta 31-jul)');
 
 
 // ---------------------------------------------------------------------------------------------
-// TERCERA MÉTRICA: ¿DICEN LO MISMO EL CARRUSEL Y EL POP-UP?
+// TERCERA MÉTRICA: ¿DICEN LO MISMO EL CARRUSEL Y LA FICHA?
 //
 // Son dos nociones distintas de "precio de referencia" y pueden contradecirse: el carrusel usa la
 // menor del mínimo previo y la mediana; el veredicto de la ficha usa el mínimo y el promedio de
-// los últimos 90 días (makeVerdict en api/aggregates.js). El 2026-07-31 Pablo abrió un parlante
-// anunciado al -72% cuya ficha decía "Precio normal" — y tenía razón la ficha.
+// los últimos 90 días. El 2026-07-31 Pablo abrió un parlante anunciado al -72% cuya ficha decía
+// "Precio normal" — y tenía razón la ficha.
 //
-// Ese día, tras cambiar la referencia, se midió que las 164 ofertas publicadas mostraban
-// "Cerca de su mínimo histórico": la contradicción desapareció sola, porque exigir que el precio
-// esté por debajo de todo lo anterior lo deja por fuerza cerca del mínimo. Esto lo vigila para
-// que no vuelva sin que nadie se entere.
+// Ese día, tras cambiar la referencia, se midió que las 164 ofertas publicadas mostraban "Cerca
+// de su mínimo histórico": la contradicción desapareció sola, porque exigir que el precio esté
+// por debajo de todo lo anterior lo deja por fuerza cerca del mínimo. Esto vigila que no vuelva.
 //
-// La condición está copiada de makeVerdict (precio <= mínimo de 90 días * 1.02) porque vive en
-// otro repo y no se puede importar. Si allí cambia, aquí hay que tocarlo: es la única copia que
-// queda y por eso está dicho aquí.
-const coherencia = await query(`
-  WITH m AS (
-    SELECT product_fk, MIN(price_online) AS minimo
-    FROM price_points
-    WHERE ts >= strftime('%s','now') - 90 * 86400
-    GROUP BY product_fk
-  )
-  SELECT p.name, o.ref, o.precio, m.minimo
-  FROM ofertas o
-  JOIN m ON m.product_fk = o.product_fk
-  JOIN products p ON p.id = o.product_fk
-  WHERE o.precio > m.minimo * 1.02
+// SE LE PREGUNTA A LA API EN VIVO, no se reimplementa su condición. La primera versión copiaba
+// aquí el "precio <= mínimo de 90 días * 1.02" de makeVerdict, que vive en el repo del Worker y
+// no se puede importar — o sea, una copia más de las que hoy costaron dos herramientas mintiendo.
+// Preguntando se prueba además la cadena entera (Worker incluido) en vez de mi versión de ella.
+const API = process.env.CHANIN_API ?? 'https://chanin-api.pablocarrascoe26.workers.dev';
+const publicadas = await query(`
+  SELECT p.retailer, p.sku, p.name, o.ref, o.precio
+  FROM ofertas o JOIN products p ON p.id = o.product_fk
 `);
-const publicadas = await query('SELECT COUNT(*) n FROM ofertas');
-console.log('\n— ¿el pop-up contradice al carrusel? —');
-if (!coherencia.length) {
-  console.log(`  ninguna de las ${publicadas[0].n} publicadas: todas saldrían como "cerca de su mínimo histórico"`);
+console.log('\n— ¿la ficha contradice al carrusel? —');
+if (!publicadas.length) {
+  console.log('  la tabla `ofertas` está vacía: nada que comprobar');
 } else {
-  console.log(`  ${coherencia.length} de ${publicadas[0].n} publicadas NO saldrían como "cerca de su mínimo" en su ficha:`);
-  for (const c of coherencia.slice(0, 10)) {
-    console.log(`     S/${(c.ref / 100).toFixed(2)} → S/${(c.precio / 100).toFixed(2)}` +
-                ` pero su mínimo de 90 días es S/${(c.minimo / 100).toFixed(2)}  ${String(c.name).slice(0, 46)}`);
+  const discrepantes = [];
+  let sinRespuesta = 0;
+  for (let i = 0; i < publicadas.length; i += 20) {
+    const trozo = publicadas.slice(i, i + 20);
+    const veredictos = await Promise.all(trozo.map(async (o) => {
+      const r = BY_ID[o.retailer].name;
+      try {
+        const res = await fetch(`${API}/history?retailer=${r}&sku=${encodeURIComponent(o.sku)}`);
+        const j = await res.json();
+        return j?.verdict?.code ?? null;
+      } catch { return null; }
+    }));
+    veredictos.forEach((code, j) => {
+      if (code == null) sinRespuesta++;
+      else if (code !== 'near_low') discrepantes.push({ ...trozo[j], code });
+    });
+  }
+  const evaluadas = publicadas.length - sinRespuesta;
+  if (!discrepantes.length) {
+    console.log(`  ninguna de las ${evaluadas} publicadas: todas salen como "cerca de su mínimo histórico" en su ficha`);
+  } else {
+    console.log(`  ${discrepantes.length} de ${evaluadas} publicadas NO salen como "cerca de su mínimo" en su ficha:`);
+    for (const d of discrepantes.slice(0, 10)) {
+      console.log(`     carrusel S/${(d.ref / 100).toFixed(2)} → S/${(d.precio / 100).toFixed(2)}` +
+                  ` · ficha "${d.code}"  ${String(d.name).slice(0, 46)}`);
+    }
+  }
+  if (sinRespuesta) console.log(`  (${sinRespuesta} sin respuesta de la API; no cuentan ni a favor ni en contra)`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// CUARTA: ROTACIÓN DEL CARRUSEL, corrida a corrida.
+// La tabla `ofertas` se reescribe entera, así que sin este resumen la pregunta "¿se está quedando
+// corto?, ¿entra y sale demasiado?" sólo se responde mirándolo a mano y acordándose de hacerlo.
+const rot = await query(`
+  SELECT calculado, publicadas, nuevas, salidas
+  FROM ofertas_resumen ORDER BY calculado DESC LIMIT 14
+`).catch(() => []);
+console.log('\n— rotación del carrusel —');
+if (!rot.length) {
+  console.log('  todavía no hay resumen: lo empieza a escribir ofertas.js desde el 2026-07-31');
+} else {
+  for (const r of rot.reverse()) {
+    console.log(`  ${new Date(r.calculado * 1000).toISOString().slice(0, 16).replace('T', ' ')}` +
+                `  ${String(r.publicadas).padStart(4)} publicadas  (+${r.nuevas} / -${r.salidas})`);
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// QUINTA: ¿IMPORTA YA LA VENTANA DE 90 DÍAS?
+// Mientras ninguna oferta publicada se apoye en datos más viejos que la ventana más corta que
+// consideraríamos, las de 30, 60 y 90 días dan lo mismo y no hay nada que decidir. Correr la
+// selección tres veces para comprobarlo costaría 90M de filas leídas cada semana; basta con mirar
+// la edad del punto más antiguo que entra en juego. El día que se acerque a 30, la decisión
+// aparece aquí sola en vez de por sorpresa.
+const edad = await query(`
+  SELECT MAX(dias) AS mas_viejo, AVG(dias) AS media FROM (
+    SELECT (strftime('%s','now') - MIN(pp.ts)) / 86400.0 AS dias
+    FROM ofertas o JOIN price_points pp ON pp.product_fk = o.product_fk
+    GROUP BY o.product_fk)
+`);
+const mv = edad[0]?.mas_viejo ?? 0;
+console.log('\n— ¿importa ya la ventana de 90 días? —');
+console.log(`  el punto más antiguo que usa una oferta publicada tiene ${mv.toFixed(1)} días` +
+            ` (media ${(edad[0]?.media ?? 0).toFixed(1)})`);
+console.log(mv < 30
+  ? '  por debajo de 30: las ventanas de 30, 60 y 90 días dan exactamente lo mismo. No hay nada que decidir.'
+  : '  YA PASA DE 30 DÍAS: toca decidir si un precio de hace meses sigue siendo "el precio de antes".');
 
 console.log('');
 log(`[auditoría] la primera métrica no discrimina con ${DIAS} días de ventana posterior: la mayoría`);
