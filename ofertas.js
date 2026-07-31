@@ -93,8 +93,23 @@ const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 // La referencia —el "antes" de cada oferta— se calcula en referencia.js, que la comparten esta
 // selección, el diagnóstico de porque-no.js y la auditoría semanal. Allí está el razonamiento
 // completo: por qué es la MENOR del mínimo previo y la mediana ponderada, y qué caso lo forzó.
-const SELECCION = `
-  WITH ${sqlReferencia()},
+// UNA SOLA ESCRITURA DE LA CADENA DE FILTROS
+//
+// Antes había dos: la selección filtraba con WHERE y --rechazadas repetía las mismas condiciones
+// en un CASE para explicar los descartes. Divergieron dos veces el mismo día (2026-07-31): una
+// por escribir "caida < 30%" donde la selección exige estrictamente por debajo del 70% del precio
+// —65 productos con el 30% clavado caían de un lado en una y del otro en la otra— y otra por una
+// CTE con nombre repetido que rompía la consulta entera. Un diagnóstico que no coincide con lo
+// que publica es peor que no tenerlo.
+//
+// Ahora la cadena se escribe UNA vez, como un CASE que asigna motivo a cada producto con
+// referencia. La selección es ese mismo CASE con `motivo = 'publicada'`; la auditoría es el mismo
+// CASE agrupado. No pueden divergir porque son la misma expresión.
+//
+// El orden del CASE es el orden de la cadena: cada producto sale con la PRIMERA razón que lo deja
+// fuera, que es la que hay que arreglar si se quiere que entre.
+const CADENA = `
+  ${sqlReferencia()},
   -- La referencia final es la MENOR entre la que medimos y el precio normal que declara la
   -- propia tienda. Nunca se sube para igualar un "antes" inflado; sólo se baja cuando la tienda
   -- admite que su precio habitual es menor que lo que nosotros vimos.
@@ -107,17 +122,20 @@ const SELECCION = `
   -- así que cuando su lista queda por debajo de nuestra medición, manda la suya.
   --
   -- Afectaba a 247 de 484 ofertas: su caída media pasa del 36% al 21%.
-  cand AS (
-    SELECT p.id,
-           MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) AS ref,
-           p.cur_online,
-           (1 - p.cur_online * 1.0 / MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref))) AS caida
+  con_ref AS (
+    SELECT p.id, p.name, p.cur_online, p.cur_stock, p.retailer, p.seller,
+           MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) AS ref
     FROM products p
     JOIN sostenidos s ON s.product_fk = p.id
-    WHERE p.cur_stock = 1                    -- sin stock no es oferta: nadie puede comprarla
-      AND p.cur_online IS NOT NULL
-      AND MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) - p.cur_online >= ${AHORRO_MINIMO}
-      AND p.cur_online < MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) * (1 - ${CAIDA_MIN})
+    WHERE p.cur_online IS NOT NULL
+  ),
+  con_caida AS (
+    SELECT *, (1 - cur_online * 1.0 / ref) AS caida FROM con_ref WHERE ref > 0
+  ),
+  -- Toda la cadena menos el centinela, que necesita saber antes quién ha pasado hasta aquí.
+  previo AS (
+    SELECT *, CASE
+      WHEN cur_stock <> 1 THEN 'sin stock'
       -- Sólo precios que fija la propia tienda. En Falabella, un vendedor nulo NO significa
       -- "es de Falabella": son 385k productos que llevan corridas sin volver a verse (los topes
       -- de página dejan fuera la cola larga de cada categoría). Antes se les cerraba la puerta
@@ -127,17 +145,34 @@ const SELECCION = `
       -- De aquí salen dos de los tres patrones de descuento fantasma de 04 §8 (lista inflada de
       -- marketplace y ancla fija de seller); el tercero, el placeholder de S/9,899, es de
       -- Promart y Oechsle, así que este filtro NO lo toca.
-      AND (p.retailer <> ${RETAILERS.falabella.id}
-           OR p.seller IS NULL
-           OR p.seller = (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}'))
+      WHEN retailer = ${RETAILERS.falabella.id} AND seller IS NOT NULL
+           AND seller <> (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}')
+           THEN 'vendedor de terceros'
+      WHEN cur_online >= ref THEN 'hoy no esta por debajo de su referencia'
+      WHEN ref - cur_online < ${AHORRO_MINIMO} THEN 'ahorro menor a S/${AHORRO_MINIMO / 100}'
+      -- Estrictamente por debajo del 70% del precio, no "caida < 30%": con precios redondos el
+      -- 30% clavado es frecuente y las dos formas NO son la misma (65 productos el 31-jul).
+      WHEN cur_online >= ref * (1 - ${CAIDA_MIN}) THEN 'caida del ${CAIDA_MIN * 100}% o menos'
+      WHEN caida > ${CAIDA_MAX} THEN 'caida mayor al ${CAIDA_MAX * 100}% (dominan los fantasmas)'
+      ELSE 'ok' END AS paso
+    FROM con_caida
   ),
   centinelas AS (
-    SELECT ref FROM cand
+    SELECT ref FROM previo WHERE paso = 'ok'
     GROUP BY ref
     HAVING COUNT(*) >= ${CENTINELA_PRODUCTOS} AND AVG(caida) >= ${CENTINELA_CAIDA}
-  )
-  SELECT id, ref, cur_online, caida FROM cand
-  WHERE caida <= ${CAIDA_MAX} AND ref NOT IN (SELECT ref FROM centinelas)
+  ),
+  motivo AS (
+    SELECT id, name, ref, cur_online, caida,
+           CASE WHEN paso <> 'ok' THEN paso
+                WHEN ref IN (SELECT ref FROM centinelas) THEN 'referencia centinela del catalogo'
+                ELSE 'publicada' END AS motivo
+    FROM previo
+  )`;
+
+const SELECCION = `
+  WITH ${CADENA}
+  SELECT id, ref, cur_online, caida FROM motivo WHERE motivo = 'publicada'
 `;
 
 // ---------------------------------------------------------------------------------------------
@@ -146,60 +181,30 @@ const SELECCION = `
 // selección, así que cada producto aparece con la PRIMERA razón que lo deja fuera.
 // ---------------------------------------------------------------------------------------------
 if (RECHAZADAS) {
-  const filas = await query(`
-    WITH ${sqlReferencia()},
-    -- 'base' es un nombre que ya usa referencia.js: aquí sería una CTE duplicada y SQLite lo
-    -- rechaza. Se llama evaluables.
-    evaluables AS (
-      SELECT p.id, p.name, p.cur_online, p.cur_stock, p.retailer, p.seller,
-             MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) AS ref
-      FROM products p JOIN sostenidos s ON s.product_fk = p.id
-      WHERE p.cur_online IS NOT NULL
-    ),
-    con_caida AS (
-      SELECT *, (1 - cur_online * 1.0 / ref) AS caida FROM evaluables WHERE ref > 0
-    ),
-    -- Los centinelas se calculan sobre EXACTAMENTE la misma población que en la selección (cand):
-    -- con stock, con ahorro y caída suficientes Y de primera parte. Sin el filtro de vendedor la
-    -- lista salía distinta y la auditoría llamaba "publicables" a 381 productos cuando la
-    -- selección dejaba 316 — un diagnóstico que contradice a lo que publica no sirve de nada.
-    centinelas AS (
-      SELECT ref FROM con_caida
-      WHERE cur_stock = 1 AND ref - cur_online >= ${AHORRO_MINIMO} AND caida >= ${CAIDA_MIN}
-        AND (retailer <> ${RETAILERS.falabella.id}
-             OR seller IS NULL
-             OR seller = (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}'))
-      GROUP BY ref
-      HAVING COUNT(*) >= ${CENTINELA_PRODUCTOS} AND AVG(caida) >= ${CENTINELA_CAIDA}
-    )
-    SELECT name, ref, cur_online, caida,
-      CASE
-        WHEN cur_stock <> 1 THEN 'sin stock'
-        WHEN retailer = ${RETAILERS.falabella.id} AND seller IS NOT NULL
-             AND seller <> (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}')
-             THEN 'vendedor de terceros'
-        WHEN caida <= 0 THEN 'hoy no esta por debajo de su minimo previo'
-        WHEN ref - cur_online < ${AHORRO_MINIMO} THEN 'ahorro menor a S/${AHORRO_MINIMO / 100}'
-        -- La misma desigualdad que usa cand, copiada tal cual y no reescrita como caida < X: la
-        -- selección exige ESTRICTAMENTE por debajo del 70%, y con precios redondos el 30% clavado
-        -- es frecuente. Escribirla de otra forma hacía que la auditoría llamara publicables a 65
-        -- productos que la selección rechazaba (medido el 31-jul).
-        WHEN cur_online >= ref * (1 - ${CAIDA_MIN}) THEN 'caida del ${CAIDA_MIN * 100}% o menos'
-        WHEN caida > ${CAIDA_MAX} THEN 'caida mayor al ${CAIDA_MAX * 100}% (dominan los fantasmas)'
-        WHEN ref IN (SELECT ref FROM centinelas) THEN 'referencia centinela del catalogo'
-        ELSE 'publicada'
-      END AS motivo
-    FROM con_caida
+  const cuenta = await query(`
+    WITH ${CADENA}
+    SELECT motivo, COUNT(*) AS n FROM motivo GROUP BY motivo ORDER BY n DESC
   `);
-  const fuera = filas.filter((f) => f.motivo !== 'publicada');
-  const cuenta = new Map();
-  for (const f of fuera) cuenta.set(f.motivo, (cuenta.get(f.motivo) ?? 0) + 1);
-  log(`[auditoría] ${filas.length} productos con referencia previa · ${filas.length - fuera.length} publicables · ${fuera.length} descartados`);
-  for (const [motivo, n] of [...cuenta].sort((a, b) => b[1] - a[1])) {
+  // Tres ejemplos por motivo, elegidos por la caída más llamativa: son los que más engañarían si
+  // se hubieran publicado, así que son los que hay que mirar cuando se duda del criterio.
+  const muestras = await query(`
+    WITH ${CADENA},
+    ordenado AS (
+      SELECT motivo, name, ref, cur_online, caida,
+             ROW_NUMBER() OVER (PARTITION BY motivo ORDER BY caida DESC) AS rk
+      FROM motivo
+    )
+    SELECT * FROM ordenado WHERE rk <= ${VER ? 10 : 3}
+  `);
+  const total = cuenta.reduce((s, c) => s + c.n, 0);
+  const publicables = cuenta.find((c) => c.motivo === 'publicada')?.n ?? 0;
+  log(`[auditoría] ${total} productos con referencia previa · ${publicables} publicables · ${total - publicables} descartados`);
+  for (const { motivo, n } of cuenta) {
+    if (motivo === 'publicada') continue;
     console.log(`   ${String(n).padStart(6)}  ${motivo}`);
-    for (const f of fuera.filter((x) => x.motivo === motivo).slice(0, VER ? 10 : 3)) {
-      console.log(`           S/${(f.ref / 100).toFixed(2)} → S/${(f.cur_online / 100).toFixed(2)}` +
-                  ` (${(f.caida * 100).toFixed(0)}%)  ${String(f.name).slice(0, 60)}`);
+    for (const m of muestras.filter((x) => x.motivo === motivo)) {
+      console.log(`           S/${(m.ref / 100).toFixed(2)} → S/${(m.cur_online / 100).toFixed(2)}` +
+                  ` (${(m.caida * 100).toFixed(0)}%)  ${String(m.name).slice(0, 60)}`);
     }
   }
   process.exit(0);
