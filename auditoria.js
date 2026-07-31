@@ -13,21 +13,28 @@
 // producto — que es exactamente el fallo del caso Puma. Así que la tasa de retorno mide si
 // nuestras referencias son precios reales.
 //
-// Se calcula para el algoritmo ACTUAL (mediana ponderada) y para el ANTERIOR (máximo sostenido)
-// sobre el mismo corte, de modo que la mejora se demuestra en vez de suponerse.
+// Se calcula para el algoritmo ACTUAL y para los dos ANTERIORES sobre el mismo corte, de modo que
+// la mejora se demuestra en vez de suponerse. La referencia de hoy no se copia aquí: sale de
+// referencia.js, la misma que publica ofertas.js — pasándole el corte como "ahora", que es para
+// lo que ese módulo admite parámetro. Hasta el 2026-07-31 esta auditoría llamaba "hoy" a la
+// mediana ponderada, que para entonces ya no era el criterio: auditaba un algoritmo inexistente.
 //
 // LÍMITE HONESTO: con ~15 días de historial el corte deja ~8 días antes y 7 después. Una
 // liquidación larga y legítima puede no haber vuelto todavía y cuenta como "no volvió", así que
 // la tasa es un SUELO, no una medida exacta. Mejora sola conforme se acumule historial.
 import { query } from './d1-client.js';
 import { FALABELLA_PRIMERA_PARTE, RETAILERS } from './schema-v2.js';
+import { sqlReferencia } from './referencia.js';
 
 const argOf = (f) => { const i = process.argv.indexOf(f); return i >= 0 ? process.argv[i + 1] : undefined; };
 const DIAS = Number(argOf('--dias') ?? 7);
 
 const CAIDA_MIN = 0.30;
 const CAIDA_MAX = 0.85;
-const PISO_CENTIMOS = 10000;
+// Ahorro mínimo, igual que en ofertas.js. Antes había aquí un piso de precio de S/100 que la
+// selección dejó de usar el 2026-07-28 (se midió que era un filtro con sólo falsos negativos) y
+// que esta auditoría siguió aplicando, midiendo por tanto otro conjunto de ofertas.
+const AHORRO_MINIMO = 2500;
 const DIAS_SOSTENIDO = 3;     // el umbral del algoritmo VIEJO, para poder compararlo
 const VUELTA = 0.90;          // se considera que volvió si recupera el 90% de la referencia
 
@@ -37,26 +44,8 @@ const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 // `dur` se recorta en T: un punto vigente al llegar el corte no puede "durar" más allá de él.
 const SQL_CANDIDATOS = `
   WITH corte AS (SELECT strftime('%s','now') - ${DIAS} * 86400 AS t),
-  pts AS (
-    SELECT pp.product_fk, pp.price_online, pp.ts, pp.in_stock,
-           MIN(COALESCE(LEAD(pp.ts) OVER (PARTITION BY pp.product_fk ORDER BY pp.ts),
-                        (SELECT t FROM corte)), (SELECT t FROM corte)) - pp.ts AS dur
-    FROM price_points pp
-    WHERE pp.ts <= (SELECT t FROM corte)
-  ),
-  acum AS (
-    SELECT product_fk, price_online, dur,
-           SUM(dur) OVER (PARTITION BY product_fk ORDER BY price_online
-                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hasta_aqui,
-           SUM(dur) OVER (PARTITION BY product_fk) AS total
-    FROM pts
-  ),
-  ref_nueva AS (   -- mediana ponderada por tiempo
-    SELECT product_fk, MIN(price_online) AS ref
-    FROM acum WHERE total > 0 AND hasta_aqui >= total / 2.0
-    GROUP BY product_fk
-  ),
-  ref_vieja AS (   -- máximo entre los precios que estuvieron vigentes >= 3 días
+  ${sqlReferencia({ ahora: '(SELECT t FROM corte)' })},
+  ref_max_sostenido AS ( -- el criterio de antes del 28-jul: máximo entre los precios vigentes >= 3 días
     SELECT product_fk, MAX(price_online) AS ref
     FROM pts WHERE dur >= ${DIAS_SOSTENIDO} * 86400
     GROUP BY product_fk
@@ -68,16 +57,18 @@ const SQL_CANDIDATOS = `
       FROM pts
     ) WHERE rk = 1
   )
-  SELECT e.product_fk, e.price_online AS precio_t, n.ref AS ref_nueva, v.ref AS ref_vieja
+  SELECT e.product_fk, e.price_online AS precio_t,
+         MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) AS ref_hoy,
+         md.ref AS ref_mediana, v.ref AS ref_max
   FROM estado_en_t e
-  JOIN products p       ON p.id = e.product_fk
-  LEFT JOIN ref_nueva n ON n.product_fk = e.product_fk
-  LEFT JOIN ref_vieja v ON v.product_fk = e.product_fk
+  JOIN products p               ON p.id = e.product_fk
+  LEFT JOIN sostenidos s        ON s.product_fk = e.product_fk
+  LEFT JOIN mediana md          ON md.product_fk = e.product_fk
+  LEFT JOIN ref_max_sostenido v ON v.product_fk = e.product_fk
   WHERE e.in_stock = 1
-    AND e.price_online >= ${PISO_CENTIMOS}
     AND (p.retailer <> ${RETAILERS.falabella.id}
          OR p.seller = (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}'))
-    AND (n.ref IS NOT NULL OR v.ref IS NOT NULL)
+    AND (s.ref IS NOT NULL OR md.ref IS NOT NULL OR v.ref IS NOT NULL)
 `;
 
 // Qué hizo el precio DESPUÉS del corte: el máximo alcanzado.
@@ -99,6 +90,7 @@ function evaluar(nombre, refDe) {
   for (const c of candidatos) {
     const ref = refDe(c);
     if (ref == null) continue;
+    if (ref - c.precio_t < AHORRO_MINIMO) continue;
     const caida = 1 - c.precio_t / ref;
     if (caida < CAIDA_MIN || caida > CAIDA_MAX) continue;
     publicadas.push({ ...c, ref, caida });
@@ -121,8 +113,9 @@ function evaluar(nombre, refDe) {
 }
 
 console.log('\n— ¿volvió el precio a su referencia? —');
-const nueva = evaluar('mediana ponderada (hoy)', (c) => c.ref_nueva);
-const vieja = evaluar('máximo sostenido (antes)', (c) => c.ref_vieja);
+const nueva = evaluar('mín. previo + mediana (hoy)', (c) => c.ref_hoy);
+const vieja = evaluar('mediana sola (hasta 31-jul)', (c) => c.ref_mediana);
+const antigua = evaluar('máximo sostenido (hasta 28-jul)', (c) => c.ref_max);
 
 // ---------------------------------------------------------------------------------------------
 // SEGUNDA MÉTRICA: ¿CUÁNTO AGUANTÓ LA REFERENCIA?
@@ -173,8 +166,8 @@ async function aguante(publicadas, etiqueta) {
 }
 
 console.log('\n— ¿cuánto tiempo estuvo vigente esa referencia? —');
-await aguante(nueva.lista, 'mediana ponderada (hoy)');
-await aguante(vieja.lista, 'máximo sostenido (antes)');
+await aguante(nueva.lista, 'mín. previo + mediana (hoy)');
+await aguante(vieja.lista, 'mediana sola (hasta 31-jul)');
 
 console.log('');
 log(`[auditoría] la primera métrica no discrimina con ${DIAS} días de ventana posterior: la mayoría`);

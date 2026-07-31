@@ -12,12 +12,15 @@
 // No responde sí/no: recorre la cadena en orden y dice EN QUÉ ESCALÓN se cayó y con qué número.
 import { query } from './d1-client.js';
 import { BY_ID, RETAILERS, decodeUrl, FALABELLA_PRIMERA_PARTE } from './schema-v2.js';
+import { sqlReferencia } from './referencia.js';
 
 const arg = (f) => { const i = process.argv.indexOf(f); return i >= 0 ? process.argv[i + 1] : undefined; };
 const URL_ = arg('--url'); const SKU = arg('--sku'); const NOMBRE = arg('--nombre'); const TIENDA = arg('--tienda');
 
-// Mismos parámetros que ofertas.js. Si allí cambian, aquí también.
-const DIAS_VENTANA = 90, CAIDA_MIN = 0.30, CAIDA_MAX = 0.85, AHORRO_MINIMO = 2500;
+// Umbrales de ofertas.js. La REFERENCIA ya no se copia: sale de referencia.js, compartida con
+// la selección, para que este diagnóstico no pueda explicar descartes de un criterio distinto
+// del que publica — que es exactamente lo que pasó el 2026-07-31.
+const CAIDA_MIN = 0.30, CAIDA_MAX = 0.85, AHORRO_MINIMO = 2500;
 
 const soles = (c) => (c == null ? '—' : 'S/ ' + (c / 100).toFixed(2));
 const ok = (m) => console.log(`   \x1b[32m✓\x1b[0m ${m}`);
@@ -70,21 +73,12 @@ if (!filas.length) {
 // Datos compartidos que hacen falta para el veredicto.
 const ids = filas.map((f) => f.id).join(',');
 const refs = new Map((await query(`
-  WITH pts AS (
-    SELECT product_fk, price_online,
-           COALESCE(LEAD(ts) OVER (PARTITION BY product_fk ORDER BY ts), strftime('%s','now')) - ts AS dur
-    FROM price_points
-    WHERE ts >= strftime('%s','now') - ${DIAS_VENTANA} * 86400 AND product_fk IN (${ids})
-  ),
-  acum AS (
-    SELECT product_fk, price_online,
-           SUM(dur) OVER (PARTITION BY product_fk ORDER BY price_online
-                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS h,
-           SUM(dur) OVER (PARTITION BY product_fk) AS t
-    FROM pts
-  )
-  SELECT product_fk, MIN(price_online) AS ref FROM acum WHERE t > 0 AND h >= t / 2.0 GROUP BY product_fk
-`)).map((r) => [r.product_fk, r.ref]));
+  WITH ${sqlReferencia({ filtro: `AND product_fk IN (${ids})` })}
+  SELECT mp.product_fk, mp.ref AS minimo_previo, md.ref AS mediana, s.ref
+  FROM sostenidos s
+  JOIN minimo_previo mp ON mp.product_fk = s.product_fk
+  JOIN mediana md       ON md.product_fk = s.product_fk
+`)).map((r) => [r.product_fk, r]));
 const publicadas = new Set((await query(`SELECT product_fk FROM ofertas WHERE product_fk IN (${ids})`)).map((r) => r.product_fk));
 const encuarentena = new Map((await query(`SELECT product_fk, motivo FROM cuarentena WHERE product_fk IN (${ids})`)).map((r) => [r.product_fk, r.motivo]));
 const puntos = new Map((await query(`SELECT product_fk, COUNT(*) n FROM price_points WHERE product_fk IN (${ids}) GROUP BY product_fk`)).map((r) => [r.product_fk, r.n]));
@@ -117,15 +111,31 @@ for (const f of filas) {
     ok(r.name === 'falabella' ? 'Lo vende Falabella (primera parte).' : 'Retailer sin marketplace.');
   }
 
-  // 3. referencia
-  const medida = refs.get(f.id);
-  if (medida == null) { no('Sin historial suficiente para calcular una referencia.'); continue; }
+  // 3. referencia. Se dice cuál de las dos medidas manda, porque es lo que explica el descarte:
+  // si manda la mediana, el precio "rebajado" ya lleva más de la mitad del tiempo y dejó de ser
+  // una rebaja; si manda el mínimo previo, el producto ya estuvo así de barato antes.
+  const m = refs.get(f.id);
+  if (m == null) { no('Sin historial suficiente para calcular una referencia.'); continue; }
+  const medida = m.ref;
   const ref = Math.min(medida, f.cur_list || medida);
   const topada = f.cur_list && f.cur_list < medida;
-  ok(`Referencia ${soles(ref)}` + (topada ? ` (medimos ${soles(medida)}, pero la tienda declara ${soles(f.cur_list)} y manda la suya)` : ''));
+  const manda = m.minimo_previo < m.mediana ? 'el mínimo previo'
+              : m.mediana < m.minimo_previo ? 'la mediana ponderada'
+              : 'las dos por igual';
+  ok(`Referencia ${soles(ref)} — manda ${manda}` +
+     ` (mínimo previo ${soles(m.minimo_previo)} · mediana ${soles(m.mediana)})` +
+     (topada ? `; la tienda declara ${soles(f.cur_list)} y manda la suya` : ''));
 
   // 4. ahorro mínimo (sustituyó al piso de precio el 2026-07-28; el porqué, en ofertas.js)
   const ahorro = ref - f.cur_online;
+  // El ahorro NEGATIVO merece su propio mensaje: desde que la referencia es el mínimo previo, es
+  // el rechazo más frecuente y no es "ahorra poco", es "no ahorra nada". Es el caso del parlante
+  // Sony que destapó todo: hoy a S/279 cuando ya se le vio a S/269, anunciado como -72%.
+  if (ahorro <= 0) {
+    no(`No hay descuento: hoy cuesta ${soles(f.cur_online)} y ya se le vio a ${soles(ref)}.`);
+    nota('Si la tienda anuncia una rebaja, es contra un precio anterior que ella misma subió.');
+    continue;
+  }
   if (ahorro < AHORRO_MINIMO) {
     no(`Sólo ahorra ${soles(ahorro)} y el mínimo son ${soles(AHORRO_MINIMO)}.`);
     nota('El carrusel tiene sitio limitado: un ahorro pequeño no justifica una tarjeta.');

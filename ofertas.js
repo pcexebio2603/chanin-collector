@@ -39,8 +39,8 @@
 // caída es 0% y desaparecen. Un pico corto ya no puede fijar la referencia por sí solo.
 //
 // (SUPERADO el 2026-07-31: la mediana aguanta el pico corto pero no el largo, y el que manipula
-// elige cuánto dura. La referencia es hoy el mínimo previo al régimen actual; el razonamiento
-// completo y el backtest están junto a la constante SELECCION, más abajo.)
+// elige cuánto dura. Hoy la referencia es la MENOR del mínimo previo y esta mediana; el
+// razonamiento y el caso que lo forzó están en referencia.js, que es de donde sale el SQL.)
 //
 // Efecto secundario deseable: si un precio rebajado se sostiene más tiempo que el anterior,
 // pasa a ser la referencia y el producto deja de anunciarse como oferta. Es correcto: a esas
@@ -54,6 +54,7 @@
 import { query, exec } from './d1-client.js';
 import { BY_ID, RETAILERS, decodeUrl, FALABELLA_PRIMERA_PARTE } from './schema-v2.js';
 import { revisar, registrar, resumen } from './guardian.js';
+import { sqlReferencia } from './referencia.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
@@ -68,7 +69,6 @@ const REVERIFICAR = process.argv.includes('--reverificar');
 // dice esta lista de sus vecinas. Sale el motivo exacto de cada descarte, no un "no cumple".
 const RECHAZADAS = process.argv.includes('--rechazadas');
 
-const DIAS_VENTANA = 90;      // historia que entra en la mediana; hoy sobra, en octubre no
 const CAIDA_MIN = 0.30;
 const CAIDA_MAX = 0.85;       // por encima domina el fantasma; ver cabecera
 // Ahorro mínimo para ocupar un hueco del carrusel. Sustituye al antiguo piso de precio de
@@ -90,100 +90,11 @@ const CENTINELA_CAIDA = 0.88;     // …y con caída media de este orden, es un 
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 
-// POR QUÉ LA REFERENCIA YA NO ES LA MEDIANA PONDERADA (2026-07-31)
-//
-// La mediana ponderada por tiempo se puso el 28-jul contra la manipulación de "subir para poder
-// anunciar" (caso Puma, arriba). Aguanta un pico corto, pero se rompe cuando el pico dura tanto
-// como el resto de la historia — y con dos semanas de base eso no es raro. Lo destapó Pablo con
-// el parlante Sony SRS-ULT10 de Promart (product_id 1001264197), que era la oferta #1 del
-// carrusel anunciada "de S/999 a S/279, -72%":
-//
-//     13-jul  S/269 ┐ 8.27 d antes del pico
-//     19-jul  S/279 ┘
-//     22-jul  S/999   9.00 d  ← el pico ocupa el 52% del tiempo observado
-//     31-jul  S/279           ← su precio de siempre, anunciado como -72%
-//
-// Con el pico ocupando más de la mitad del tiempo, la mediana ponderada ES el precio inflado.
-// No es un fallo de implementación: es el límite del estadístico. Y le pasa a toda la familia
-// —mediana, percentiles, "precio sostenido"— porque todas miden PROPORCIÓN DE TIEMPO, y quien
-// manipula controla justamente cuánto dura la subida.
-//
-// La referencia es ahora la MENOR de dos: el precio más bajo al que estuvo el producto antes del
-// régimen de precio actual, y la mediana ponderada de siempre. El mínimo previo es inmune por
-// construcción —alargar un pico no baja ningún mínimo, así que la duración deja de ser palanca— y
-// no tiene ningún parámetro que calibrar. La mediana se queda porque aporta lo único que al
-// mínimo le falta: EXPIRAR. Medido el 31-jul, el mínimo previo a solas daba 1,015 candidatas
-// contra 413 de la mediana, y el 64% de ellas habían bajado hacía 8 días o más: sin la mediana,
-// una bajada vieja se sigue anunciando hasta que su régimen anterior sale de la ventana de 90
-// días. Con las dos, 312 candidatas — la intersección exacta, más estricta que cualquiera de
-// ellas por separado, que es lo que pide elegir precisión.
-//
-// MEDIDO sobre la foto de las 235 ofertas publicadas el 31-jul (backtest en el commit):
-//     70 ofertas FALSAS (el precio de hoy no mejora el de antes del pico) → 0 sobreviven
-//     10 INFLADAS (bajada real, pero anunciada contra el pico: -42% medio cuando era -19%) → 2
-//     de 235 publicadas quedan 146; el descuento medio anunciado no se mueve (38.6% → 38.5%)
-// El coste son 11 ofertas que sí eran un mínimo nuevo. Nueve de ellas traían pico y su descuento
-// honesto era ridículo (Blazer 156→390→150: el -62% que anunciábamos era en realidad un -4%).
-// Las otras dos son escaleras limpias (cámaras Tenda, 169→129→109) que se pierden porque el
-// ahorro contra el escalón anterior no llega a S/25. Es el precio de elegir precisión.
-//
-// "Régimen actual" es el tramo maximal de precio igual, no la última fila: la BD escribe fila
-// también cuando cambian stock o tarjeta, así que hay filas consecutivas al mismo precio
-// (3499 → 3499). Medido: usar el tramo en vez de la fila conserva 4 ofertas más sin dejar
-// entrar ninguna falsa.
-// El cálculo de la referencia vive aparte porque lo usan DOS consultas: la selección y la
-// auditoría de --rechazadas. Si se duplicara, la auditoría acabaría explicando descartes de un
-// criterio distinto del que publica, que es peor que no tener auditoría.
-const REFERENCIA = `
-  pts AS (
-    SELECT product_fk, ts, price_online,
-           LAG(price_online) OVER (PARTITION BY product_fk ORDER BY ts) AS ant,
-           COALESCE(LEAD(ts) OVER (PARTITION BY product_fk ORDER BY ts), strftime('%s','now')) - ts AS dur
-    FROM price_points
-    WHERE ts >= strftime('%s','now') - ${DIAS_VENTANA} * 86400
-  ),
-  -- (1) MÍNIMO PREVIO. Inicio del régimen de precio actual = la primera fila del último tramo de
-  -- precio igual; el mínimo de todo lo anterior es la referencia. Inmune al pico: alargar una
-  -- subida no baja ningún mínimo.
-  inicio AS (
-    SELECT product_fk, MAX(ts) AS desde
-    FROM pts
-    WHERE ant IS NULL OR price_online <> ant
-    GROUP BY product_fk
-  ),
-  minimo_previo AS (
-    SELECT p.product_fk, MIN(p.price_online) AS ref
-    FROM pts p JOIN inicio i ON i.product_fk = p.product_fk
-    WHERE p.ts < i.desde
-    GROUP BY p.product_fk
-  ),
-  -- (2) MEDIANA PONDERADA POR TIEMPO. Ya no sostiene la referencia por sí sola, pero se conserva
-  -- porque aporta algo que el mínimo previo no tiene: EXPIRA. Cuando el precio rebajado lleva más
-  -- de la mitad del tiempo, la mediana baja hasta él y el producto deja de anunciarse — que es lo
-  -- que este archivo decidió el 28-jul: a esas alturas ya no es una rebaja, es su precio nuevo.
-  acum AS (
-    SELECT product_fk, price_online,
-           SUM(dur) OVER (PARTITION BY product_fk ORDER BY price_online
-                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hasta_aqui,
-           SUM(dur) OVER (PARTITION BY product_fk) AS total
-    FROM pts
-  ),
-  mediana AS (
-    SELECT product_fk, MIN(price_online) AS ref
-    FROM acum
-    WHERE total > 0 AND hasta_aqui >= total / 2.0
-    GROUP BY product_fk
-  ),
-  -- Manda la MENOR de las dos, igual que con el precio de lista de la tienda: la referencia nunca
-  -- se sube para poder anunciar más, sólo se baja. El resultado es la intersección exacta de las
-  -- dos reglas, así que no puede publicar nada que cualquiera de ellas rechace.
-  sostenidos AS (
-    SELECT mp.product_fk, MIN(mp.ref, md.ref) AS ref
-    FROM minimo_previo mp JOIN mediana md ON md.product_fk = mp.product_fk
-  )`;
-
+// La referencia —el "antes" de cada oferta— se calcula en referencia.js, que la comparten esta
+// selección, el diagnóstico de porque-no.js y la auditoría semanal. Allí está el razonamiento
+// completo: por qué es la MENOR del mínimo previo y la mediana ponderada, y qué caso lo forzó.
 const SELECCION = `
-  WITH ${REFERENCIA},
+  WITH ${sqlReferencia()},
   -- La referencia final es la MENOR entre la que medimos y el precio normal que declara la
   -- propia tienda. Nunca se sube para igualar un "antes" inflado; sólo se baja cuando la tienda
   -- admite que su precio habitual es menor que lo que nosotros vimos.
@@ -236,7 +147,7 @@ const SELECCION = `
 // ---------------------------------------------------------------------------------------------
 if (RECHAZADAS) {
   const filas = await query(`
-    WITH ${REFERENCIA},
+    WITH ${sqlReferencia()},
     base AS (
       SELECT p.id, p.name, p.cur_online, p.cur_stock, p.retailer, p.seller,
              MIN(s.ref, COALESCE(NULLIF(p.cur_list, 0), s.ref)) AS ref
@@ -246,9 +157,16 @@ if (RECHAZADAS) {
     con_caida AS (
       SELECT *, (1 - cur_online * 1.0 / ref) AS caida FROM base WHERE ref > 0
     ),
+    -- Los centinelas se calculan sobre EXACTAMENTE la misma población que en la selección (cand):
+    -- con stock, con ahorro y caída suficientes Y de primera parte. Sin el filtro de vendedor la
+    -- lista salía distinta y la auditoría llamaba "publicables" a 381 productos cuando la
+    -- selección dejaba 316 — un diagnóstico que contradice a lo que publica no sirve de nada.
     centinelas AS (
       SELECT ref FROM con_caida
       WHERE cur_stock = 1 AND ref - cur_online >= ${AHORRO_MINIMO} AND caida >= ${CAIDA_MIN}
+        AND (retailer <> ${RETAILERS.falabella.id}
+             OR seller IS NULL
+             OR seller = (SELECT id FROM sellers WHERE name = '${FALABELLA_PRIMERA_PARTE}'))
       GROUP BY ref
       HAVING COUNT(*) >= ${CENTINELA_PRODUCTOS} AND AVG(caida) >= ${CENTINELA_CAIDA}
     )
@@ -260,7 +178,11 @@ if (RECHAZADAS) {
              THEN 'vendedor de terceros'
         WHEN caida <= 0 THEN 'hoy no esta por debajo de su minimo previo'
         WHEN ref - cur_online < ${AHORRO_MINIMO} THEN 'ahorro menor a S/${AHORRO_MINIMO / 100}'
-        WHEN caida < ${CAIDA_MIN} THEN 'caida menor al ${CAIDA_MIN * 100}%'
+        -- La misma desigualdad que usa cand, copiada tal cual y no reescrita como caida < X: la
+        -- selección exige ESTRICTAMENTE por debajo del 70%, y con precios redondos el 30% clavado
+        -- es frecuente. Escribirla de otra forma hacía que la auditoría llamara publicables a 65
+        -- productos que la selección rechazaba (medido el 31-jul).
+        WHEN cur_online >= ref * (1 - ${CAIDA_MIN}) THEN 'caida del ${CAIDA_MIN * 100}% o menos'
         WHEN caida > ${CAIDA_MAX} THEN 'caida mayor al ${CAIDA_MAX * 100}% (dominan los fantasmas)'
         WHEN ref IN (SELECT ref FROM centinelas) THEN 'referencia centinela del catalogo'
         ELSE 'publicada'
