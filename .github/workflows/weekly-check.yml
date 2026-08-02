@@ -3,11 +3,22 @@ name: Chequeo semanal del colector
 on:
   schedule:
     # Domingo 12:07 Lima (UTC-5), fuera de la ventana del colector.
-    # GitHub atribuye los runs programados a quien PUSHEÓ el último cambio de este fichero
-    # (no a quien firma el commit), y a esa cuenta le manda los correos de fallo. Si vuelven a
-    # llegar a la cuenta equivocada: `gh auth switch` a la buena y tocar esta línea del cron.
     - cron: '7 17 * * 0'
   workflow_dispatch:
+
+# EL AVISO NO DEPENDE DE LA ATRIBUCIÓN DE GITHUB.
+# El correo automático de "workflow failed" va al ACTOR del run, y para los runs programados ese
+# actor lo elige GitHub con una regla que no hemos logrado fijar: se corrigió el 26-jul tocando el
+# cron desde la cuenta buena y aun así el 2-ago el aviso salió otra vez a nombre de
+# pjcarrasco-avatar — con este fichero empujado por pcexebio2603 desde el 28-jul. Lo único que
+# cambió en medio fueron pushes al repo hechos con la otra cuenta.
+#
+# En vez de seguir persiguiendo esa regla, el aviso va por un canal que sí controlamos: si algo
+# falla se abre un issue ASIGNADO a pcexebio2603. GitHub notifica siempre al asignado, sea quien
+# sea el actor, y además queda registro en el repo en vez de sólo en una bandeja de correo.
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   check:
@@ -24,6 +35,35 @@ jobs:
       # La auditoría va PRIMERO y con `always()` más abajo no haría falta, pero así se ejecuta
       # aunque el chequeo acabe en WARN: interesa el número incluso —sobre todo— cuando algo va mal.
       - name: Auditoría del detector de ofertas
-        run: node auditoria.js --dias 7
+        run: |
+          set -o pipefail
+          node auditoria.js --dias 7 2>&1 | tee auditoria.txt
+
       - name: Chequeo semanal → D1
-        run: node weekly-check-d1.js
+        run: |
+          set -o pipefail
+          node weekly-check-d1.js 2>&1 | tee informe.md
+
+      - name: Avisar por issue si algo falló
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "El chequeo semanal terminó en WARN o falló."
+            echo
+            echo "Corrida: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            if [ -s informe.md ]; then cat informe.md; else echo "_(el chequeo no llegó a emitir informe)_"; fi
+            echo
+            echo "<details><summary>Auditoría del detector de ofertas</summary>"
+            echo
+            echo '```'
+            if [ -s auditoria.txt ]; then tail -60 auditoria.txt; else echo "(no llegó a correr)"; fi
+            echo '```'
+            echo "</details>"
+          } > cuerpo.md
+          gh issue create \
+            --title "Chequeo semanal en WARN — $(date -u +%Y-%m-%d)" \
+            --body-file cuerpo.md \
+            --assignee pcexebio2603

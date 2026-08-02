@@ -57,22 +57,38 @@ for (const r of await query(
   lastRunByRetailer[r.retailer] = r;
 }
 
-// SKUs vistos en la corrida ANTERIOR de cada retailer. Es la vara para juzgar si la última
-// perdió cobertura de verdad. Se compara contra la anterior y no contra el máximo histórico
-// porque los catálogos encogen solos: promart pasó de 87,425 a 82,283 SKUs en cinco días,
-// también en corridas con cero errores. Anclar al mejor dato de siempre convertiría esa deriva
-// normal en un aviso permanente.
-const anteriorByRetailer = {};
-for (const r of await query(
-  `SELECT retailer, products FROM (
-     SELECT retailer, products, ROW_NUMBER() OVER (PARTITION BY retailer ORDER BY id DESC) rk
-     FROM runs
-   ) WHERE rk = 2`
-)) {
-  anteriorByRetailer[r.retailer] = r.products;
+// Vara de cobertura: la MEDIANA de las últimas corridas de cada retailer, no la anterior suelta.
+//
+// Se comparaba contra la corrida inmediatamente anterior, y eso hacía sonar la alarma por ruido
+// conocido. Medido el 2026-08-02 sobre las 12 últimas corridas de Falabella: oscila entre 125,889
+// y 136,128 SKUs —un 8.1%— sin tendencia alguna, porque su listado pagina hasta 150 páginas y el
+// marketplace entra y sale. Con esa oscilación y un umbral del 95%, basta que a una corrida alta
+// le siga una baja para disparar el aviso: pasó el 28-jul (94.9%), el 30-jul (95.3%), el 1-ago
+// (93.7%) y el 2-ago (93.4%), las cuatro sin que se perdiera nada.
+//
+// La mediana de seis corridas (~3 días) absorbe el vaivén y sigue viendo una caída de verdad: hoy
+// da 126,907 y la última corrida es el 99.2% de eso, sin aviso; un derrumbe a 90k sería el 71% y
+// avisaría igual. Se mantiene el criterio de NO anclar al máximo histórico, por lo de siempre:
+// los catálogos encogen solos (promart 87,425 → 82,283 en cinco días con cero errores).
+const VENTANA_VARA = 6;
+const varaByRetailer = {};
+{
+  const filas = await query(
+    `SELECT retailer, products FROM (
+       SELECT retailer, products, ROW_NUMBER() OVER (PARTITION BY retailer ORDER BY id DESC) rk
+       FROM runs
+     ) WHERE rk BETWEEN 2 AND ${VENTANA_VARA + 1}`
+  );
+  const porRetailer = {};
+  for (const f of filas) (porRetailer[f.retailer] ??= []).push(f.products);
+  for (const [r, vals] of Object.entries(porRetailer)) {
+    vals.sort((a, b) => a - b);
+    const m = Math.floor(vals.length / 2);
+    varaByRetailer[r] = vals.length % 2 ? vals[m] : Math.round((vals[m - 1] + vals[m]) / 2);
+  }
 }
 
-// Caída de cobertura respecto a la corrida anterior que sí merece aviso.
+// Caída de cobertura respecto a esa vara que sí merece aviso.
 const COBERTURA_MINIMA = 0.95;
 
 // Evaluación
@@ -109,18 +125,18 @@ for (const r of RETAILERS) {
   if (run.status === 'fallo') {
     warns.push(`Retailer ${r}: última corrida con estado "fallo".`);
   } else {
-    const anterior = anteriorByRetailer[r];
-    const cobertura = anterior ? run.products / anterior : 1;
+    const vara = varaByRetailer[r];
+    const cobertura = vara ? run.products / vara : 1;
     const pct = (cobertura * 100).toFixed(1);
     if (cobertura < COBERTURA_MINIMA) {
       warns.push(
-        `Retailer ${r}: vio ${run.products} SKUs, el ${pct}% de los ${anterior} de la corrida ` +
-          `anterior. Caída de cobertura, no ruido de la API.`
+        `Retailer ${r}: vio ${run.products} SKUs, el ${pct}% de los ${vara} de la mediana de sus ` +
+          `últimas ${VENTANA_VARA} corridas. Caída de cobertura, no ruido de la API.`
       );
     } else if (run.status === 'parcial') {
       notes.push(
         `Retailer ${r}: corrida "parcial" por ${run.errors} categoría(s) con error transitorio, ` +
-          `pero conservó el ${pct}% de la cobertura anterior (${run.products} SKUs). Sin acción.`
+          `pero conservó el ${pct}% de su cobertura habitual (${run.products} SKUs). Sin acción.`
       );
     }
   }
