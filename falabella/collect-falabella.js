@@ -216,7 +216,7 @@ function normalize(p, categoryName) {
 }
 
 async function main() {
-  const { saveRow, insertRun, flush, maybeFlush, loaded } = await makeD1Writer();
+  const { saveRow, insertRun, flush, maybeFlush, loaded } = await makeD1Writer(['falabella']);
   log(`BD: Cloudflare D1 (${loaded.toLocaleString('es-PE')} con estado actual)`);
 
   const cats = CATEGORIES.filter((c) => !onlyCategory || c.id === onlyCategory);

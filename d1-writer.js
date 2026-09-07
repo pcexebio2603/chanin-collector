@@ -18,20 +18,69 @@ const num = (v) => (v == null ? 'NULL' : Number(v));
 
 const UMBRAL = 5000; // cambios acumulados antes de volcar a D1
 
-export async function makeD1Writer() {
-  // 1. Estado actual de todos los productos (paginado por keyset sobre la PK).
+// `retailers`: nombres de las tiendas que ESTA corrida va a tocar. El estado se carga sólo para
+// ellas, y no para el catálogo entero.
+//
+// Por qué (2026-09-07): cada proceso cargaba los 913,036 productos de la base, y por corrida hay
+// dos procesos (collect.js con las tres VTEX, collect-falabella.js con la suya). Eran 1.83M filas
+// leídas por corrida, 3.65M al día — el 73% del cupo diario de D1, que Cloudflare empezó a
+// aplicar el 1-sep con un tope de 5M. Como los subconjuntos por tienda parten la tabla, cada
+// proceso lee sólo los suyos y el total de la corrida vuelve a ser una sola pasada.
+//
+// MEDIDO cargando el estado con esta misma función: VTEX 362,644 + falabella 551,055 = 913,699,
+// contra las 913,036 que el log de la corrida de esa mañana reportaba para UN solo proceso (la
+// diferencia de 663 son productos que la propia corrida creó después). O sea 1.83M/día en vez de
+// 3.65M: del 73% del cupo al 37%.
+//
+// El ahorro depende de que la paginación entre por el índice; ver el comentario de abajo antes de
+// "simplificar" esto a un WHERE ... IN con keyset sobre la PK, que fue justo lo que no funcionó.
+//
+// El parámetro NO es opcional a propósito. Si un proceso guarda filas de una tienda cuyo estado
+// no cargó, `prev` sale undefined y el producto se trata como NUEVO: se reinsertaría un
+// price_point en cada corrida y el historial quedaría envenenado en silencio. Por eso `saveRow`
+// lanza si le llega una tienda que no está en la lista — un fallo ruidoso en vez de datos malos.
+export async function makeD1Writer(retailers) {
+  if (!Array.isArray(retailers) || !retailers.length) {
+    throw new Error('makeD1Writer(retailers): hay que declarar qué tiendas toca esta corrida');
+  }
+  const permitidas = new Set(retailers);
+  const idsRetailer = retailers.map((r) => {
+    if (!RETAILERS[r]) throw new Error(`makeD1Writer: retailer desconocido "${r}"`);
+    return RETAILERS[r].id;
+  });
+
+  // 1. Estado actual de los productos DE ESAS TIENDAS.
+  //
+  // Se pagina POR TIENDA y con keyset sobre `product_id`, no sobre la PK, para que entre por
+  // `idx_products_pid (retailer, product_id)`. Medido el 2026-09-07: paginar por `id` con un
+  // `WHERE retailer IN (...)` NO usa ese índice y escanea la tabla igual — 725,294 filas leídas
+  // para devolver 3. Por product_id: 3 filas leídas para 3 devueltas.
+  //
+  // El desempate por `id` no es adorno: varios SKUs comparten product_id (las variantes de un
+  // mismo producto), así que un keyset sobre product_id a secas se saltaría todas las filas que
+  // comparten el último valor de la página. Esas quedarían fuera del estado, se tratarían como
+  // nuevas y duplicarían su historial de precios en cada corrida, en silencio.
   const current = new Map(); // retailer|sku → { id, cur_online, cur_list, cur_stock, cur_card }
   const PAGE = 25000;
-  let lastId = 0;
-  for (;;) {
-    const rows = await query(
-      `SELECT id, retailer, sku, cur_online, cur_list, cur_stock, cur_card, seller
-       FROM products WHERE id > ? ORDER BY id LIMIT ${PAGE}`,
-      [lastId]
-    );
-    for (const r of rows) current.set(BY_ID[r.retailer].name + '|' + r.sku, r);
-    if (rows.length < PAGE) break;
-    lastId = rows[rows.length - 1].id;
+  let cargados = 0;
+  for (const idR of idsRetailer) {
+    let ultPid = '';
+    let ultId = 0;
+    for (;;) {
+      const rows = await query(
+        `SELECT id, retailer, sku, product_id, cur_online, cur_list, cur_stock, cur_card, seller
+         FROM products
+         WHERE retailer = ? AND (product_id > ? OR (product_id = ? AND id > ?))
+         ORDER BY product_id, id LIMIT ${PAGE}`,
+        [idR, ultPid, ultPid, ultId]
+      );
+      for (const r of rows) current.set(BY_ID[r.retailer].name + '|' + r.sku, r);
+      cargados += rows.length;
+      if (rows.length < PAGE) break;
+      const ult = rows[rows.length - 1];
+      ultPid = ult.product_id;
+      ultId = ult.id;
+    }
   }
 
   // 2. Diccionarios de marcas y categorías (nombre → id).
@@ -52,6 +101,13 @@ export async function makeD1Writer() {
 
   // Igual firma que el writer local: síncrono, solo acumula, devuelve 1/0.
   function saveRow(row) {
+    if (!permitidas.has(row.retailer)) {
+      throw new Error(
+        `saveRow recibió un producto de "${row.retailer}" pero esta corrida sólo cargó el estado de ` +
+        `[${[...permitidas].join(', ')}]. Sin su estado previo lo trataría como nuevo y duplicaría ` +
+        `su historial de precios.`
+      );
+    }
     const key = row.retailer + '|' + row.sku;
     const prev = current.get(key);
 
@@ -231,7 +287,7 @@ export async function makeD1Writer() {
     }
   }
 
-  return { saveRow, insertRun, maybeFlush, flush, loaded: current.size };
+  return { saveRow, insertRun, maybeFlush, flush, loaded: cargados };
 }
 
 async function execChunks(statements, perChunk = 25) {

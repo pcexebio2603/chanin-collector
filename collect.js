@@ -21,7 +21,9 @@ const maxPages = argOf('--max-pages') ? Number(argOf('--max-pages')) : Infinity;
 
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 
-const { saveRow, insertRun, flush, maybeFlush, loaded } = await makeD1Writer();
+const { saveRow, insertRun, flush, maybeFlush, loaded } = await makeD1Writer(
+  onlyRetailer ? [onlyRetailer] : Object.keys(RETAILERS)
+);
 log(`BD: Cloudflare D1 (${loaded.toLocaleString('es-PE')} productos con estado actual)`);
 
 let exitCode = 0;
