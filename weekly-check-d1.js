@@ -33,15 +33,24 @@ await exec(
 const prevRows = await query(`SELECT date, dias_total, detail FROM checks ORDER BY id DESC LIMIT 1`);
 const prev = prevRows[0] ?? null;
 
-// Cobertura actual (~7s en D1 sobre la BD completa)
+// Cobertura: cuántos días distintos llevamos midiendo cada retailer.
+//
+// Salía de contar fechas distintas sobre `price_points` con dos JOINs — un ESCANEO COMPLETO de la
+// tabla grande cada domingo. Con el cupo diario de D1 en 5M filas (Cloudflare empezó a aplicarlo
+// el 1-sep-2026) eso solo ya era una fracción enorme del presupuesto, y el 6-sep contribuyó a
+// tumbar la API pública. El mismo dato sale de `runs`, que tiene cientos de filas: **790 filas
+// leídas en vez de millones**, medido.
+//
+// OJO CON LA DISCONTINUIDAD: los dos métodos no dan lo mismo. `runs` sólo existe desde el 17-jul
+// y los precios desde el 13-jul, así que el método nuevo no cuenta esos primeros días: 208 días
+// totales contra los ~223 que habría dado el viejo. Como el chequeo sólo mira que el número
+// CREZCA respecto del anterior (195 el 30-ago), el cambio no dispara un aviso falso, y a partir
+// del próximo chequeo ambos lados de la comparación usan el mismo método.
 const diasByRetailer = {};
 let diasTotal = 0;
-// Esquema v2: `date` ya no se guarda (sale de ts, que es epoch) y `retailer` es un FK.
 for (const r of await query(
-  `SELECT rt.name AS retailer, COUNT(DISTINCT date(pp.ts, 'unixepoch')) dias
-   FROM price_points pp
-   JOIN products  p  ON p.id  = pp.product_fk
-   JOIN retailers rt ON rt.id = p.retailer
+  `SELECT rt.name AS retailer, COUNT(DISTINCT date(r.ts, 'unixepoch')) dias
+   FROM runs r JOIN retailers rt ON rt.name = r.retailer
    GROUP BY rt.name`
 )) {
   diasByRetailer[r.retailer] = r.dias;

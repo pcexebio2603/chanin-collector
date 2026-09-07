@@ -34,10 +34,12 @@ jobs:
       # Sin npm install: el chequeo solo usa d1-client.js (fetch nativo de Node 20).
       # La auditoría va PRIMERO y con `always()` más abajo no haría falta, pero así se ejecuta
       # aunque el chequeo acabe en WARN: interesa el número incluso —sobre todo— cuando algo va mal.
-      - name: Auditoría del detector de ofertas
-        run: |
-          set -o pipefail
-          node auditoria.js --dias 7 2>&1 | tee auditoria.txt
+      # AUDITORÍA APAGADA (2026-09-06): retro-simula sobre todo el historial y se comía decenas
+      # de millones de filas de un golpe, con el cupo diario de D1 en 5M. Vuelve con Caza Precio.
+      # - name: Auditoría del detector de ofertas
+      #   run: |
+      #     set -o pipefail
+      #     node auditoria.js --dias 7 2>&1 | tee auditoria.txt
 
       - name: Chequeo semanal → D1
         run: |
