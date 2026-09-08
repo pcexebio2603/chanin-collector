@@ -28,12 +28,11 @@ const UMBRAL = 5000; // cambios acumulados antes de volcar a D1
 // proceso lee sólo los suyos y el total de la corrida vuelve a ser una sola pasada.
 //
 // MEDIDO cargando el estado con esta misma función: VTEX 362,644 + falabella 551,055 = 913,699,
-// contra las 913,036 que el log de la corrida de esa mañana reportaba para UN solo proceso (la
-// diferencia de 663 son productos que la propia corrida creó después). O sea 1.83M/día en vez de
-// 3.65M: del 73% del cupo al 37%.
+// contra las 913,036 que el log reportaba para UN solo proceso. O sea una pasada por corrida en
+// vez de dos: 1.83M/día en vez de 3.65M, del 73% del cupo al 37%.
 //
-// El ahorro depende de que la paginación entre por el índice; ver el comentario de abajo antes de
-// "simplificar" esto a un WHERE ... IN con keyset sobre la PK, que fue justo lo que no funcionó.
+// El ahorro depende ENTERAMENTE de que la paginación entre por el índice — el primer intento leía
+// diez veces más que no filtrar nada. Ver el comentario de abajo antes de tocar el WHERE.
 //
 // El parámetro NO es opcional a propósito. Si un proceso guarda filas de una tienda cuyo estado
 // no cargó, `prev` sale undefined y el producto se trata como NUEVO: se reinsertaría un
@@ -51,35 +50,34 @@ export async function makeD1Writer(retailers) {
 
   // 1. Estado actual de los productos DE ESAS TIENDAS.
   //
-  // Se pagina POR TIENDA y con keyset sobre `product_id`, no sobre la PK, para que entre por
-  // `idx_products_pid (retailer, product_id)`. Medido el 2026-09-07: paginar por `id` con un
-  // `WHERE retailer IN (...)` NO usa ese índice y escanea la tabla igual — 725,294 filas leídas
-  // para devolver 3. Por product_id: 3 filas leídas para 3 devueltas.
+  // Se pagina POR TIENDA con keyset sobre `sku`, que entra por el índice implícito de
+  // UNIQUE(retailer, sku). Como el sku es único dentro de cada tienda, no hace falta desempate y
+  // la condición queda en una sola comparación: sin OR, el planificador usa el índice.
   //
-  // El desempate por `id` no es adorno: varios SKUs comparten product_id (las variantes de un
-  // mismo producto), así que un keyset sobre product_id a secas se saltaría todas las filas que
-  // comparten el último valor de la página. Esas quedarían fuera del estado, se tratarían como
-  // nuevas y duplicarían su historial de precios en cada corrida, en silencio.
+  // ESTO YA SE HIZO MAL UNA VEZ, el 2026-09-07, y conviene no repetirlo:
+  //   · `WHERE retailer IN (...)` paginando por la PK  → 725,294 filas leídas para devolver 3.
+  //     El IN sobre retailer no sirve si el orden es por id: escanea la tabla igual.
+  //   · keyset por product_id con `(product_id > ? OR (product_id = ? AND id > ?))` → el OR
+  //     tumba el índice en cuanto se pagina en profundidad. MEDIDO en producción al día
+  //     siguiente: 9,399,614 filas leídas en 38 páginas para devolver 914k, casi el doble de lo
+  //     que costaba cargar el catálogo entero. Agotó el cupo diario a las 07:00 y tumbó la API.
+  //     El `LIMIT 3` con el que se validó dio verde porque la PRIMERA página sí entra por el
+  //     índice; el coste aparece al avanzar. Validar paginación con la primera página no sirve.
   const current = new Map(); // retailer|sku → { id, cur_online, cur_list, cur_stock, cur_card }
   const PAGE = 25000;
   let cargados = 0;
   for (const idR of idsRetailer) {
-    let ultPid = '';
-    let ultId = 0;
+    let ultSku = '';
     for (;;) {
       const rows = await query(
-        `SELECT id, retailer, sku, product_id, cur_online, cur_list, cur_stock, cur_card, seller
-         FROM products
-         WHERE retailer = ? AND (product_id > ? OR (product_id = ? AND id > ?))
-         ORDER BY product_id, id LIMIT ${PAGE}`,
-        [idR, ultPid, ultPid, ultId]
+        `SELECT id, retailer, sku, cur_online, cur_list, cur_stock, cur_card, seller
+         FROM products WHERE retailer = ? AND sku > ? ORDER BY sku LIMIT ${PAGE}`,
+        [idR, ultSku]
       );
       for (const r of rows) current.set(BY_ID[r.retailer].name + '|' + r.sku, r);
       cargados += rows.length;
       if (rows.length < PAGE) break;
-      const ult = rows[rows.length - 1];
-      ultPid = ult.product_id;
-      ultId = ult.id;
+      ultSku = rows[rows.length - 1].sku;
     }
   }
 
